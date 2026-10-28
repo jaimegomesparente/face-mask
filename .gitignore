@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Media (test inputs / outputs)
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
