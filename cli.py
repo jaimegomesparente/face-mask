@@ -4,6 +4,7 @@ Quickly anonymize videos in background or batch pipelines.
 """
 
 import argparse
+import os
 import sys
 import time
 from tqdm import tqdm
@@ -25,11 +26,8 @@ def main():
     args = parse_args()
 
     if args.output is None:
-        dot_idx = args.input.rfind(".")
-        if dot_idx != -1:
-            output_path = f"{args.input[:dot_idx]}_masked.mp4"
-        else:
-            output_path = f"{args.input}_masked.mp4"
+        # splitext only looks at the file name (rfind(".") also matched dots in folder names)
+        output_path = f"{os.path.splitext(args.input)[0]}_masked.mp4"
     else:
         output_path = args.output
 
