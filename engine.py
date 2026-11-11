@@ -496,14 +496,9 @@ class FaceMasker:
     ) -> int:
         # 1. Pixelate every box, overlapping ones included: pixelating twice is harmless,
         #    dropping a box could leave part of a face visible.
-        for ((fx, fy, fw, fh), _), _, _ in boxes:
-            pad_x = max(int(fw * 0.18), int(fh * 0.12))
-            pad_y = int(fh * 0.12)
-            px1 = max(0, fx - pad_x)
-            py1 = max(0, fy - pad_y)
-            px2 = min(image.shape[1], fx + fw + pad_x)
-            py2 = min(image.shape[0], fy + fh + int(1.25 * pad_y))
-            self.apply_pixelation(image, px1, py1, px2 - px1, py2 - py1, pixel_size=pixel_size)
+        #    The whole head box (face + forehead, hairline, ears, chin) is pixelated.
+        for (_, (hx, hy, hw, hh)), _, _ in boxes:
+            self.apply_pixelation(image, hx, hy, hw, hh, pixel_size=pixel_size)
 
         # 2. Draw thin green head tracking box + ID badge, deduplicated (overlay only)
         drawn = self._dedupe_frame_boxes(boxes)
