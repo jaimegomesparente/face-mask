@@ -128,7 +128,8 @@ class PersistentTracker:
         min_hits: int = 3,
         high_conf: float = 0.40,
         profile_conf: float = 0.28,
-        hold_frames: int = 2,
+        hold_frames: int = 3,
+        lead_frames: int = 3,
         max_interp_gap: int = 15,
         min_ref_size: float = 40.0,
     ):
@@ -139,6 +140,7 @@ class PersistentTracker:
         self.high_conf = high_conf
         self.profile_conf = profile_conf
         self.hold_frames = hold_frames
+        self.lead_frames = lead_frames
         self.max_interp_gap = max_interp_gap
         self.min_ref_size = min_ref_size
 
@@ -230,7 +232,6 @@ class PersistentTracker:
         return mx >= self.high_conf or (n >= 4 and mean >= self.profile_conf)
 
     def _expand_track(self, t: dict, n_frames: int, frame_size: Tuple[int, int] = (0, 0)) -> List[Tuple[int, FBox, int, bool]]:
-        frame_w, frame_h = frame_size
         frames = sorted(t['obs'])
         obs_dict = {f: t['obs'][f][0] for f in frames}
 
@@ -265,35 +266,19 @@ class PersistentTracker:
             full = np.arange(first, last + 1)
             interp = np.stack([np.interp(full, xs, boxes[:, i]) for i in range(4)], axis=1)
 
-            # Check if track ends near frame border or had high exit speed
-            last_box = interp[-1]
-            is_border = (last_box[0] <= 20 or last_box[1] <= 20 or
-                         (frame_w > 0 and last_box[0] + last_box[2] >= frame_w - 20) or
-                         (frame_h > 0 and last_box[1] + last_box[3] >= frame_h - 20))
-
-            if len(seg_frames) >= 2:
-                f_penult = seg_frames[-2]
-                dt_end = last - f_penult
-                if dt_end > 0:
-                    b_penult = obs_dict[f_penult]
-                    end_dist = math.hypot((last_box[0] + last_box[2]/2) - (b_penult[0] + b_penult[2]/2),
-                                          (last_box[1] + last_box[3]/2) - (b_penult[1] + b_penult[3]/2))
-                    end_speed = end_dist / dt_end
-                else:
-                    end_speed = 0.0
-            else:
-                end_speed = 0.0
-
-            ref_size = max(last_box[2], last_box[3], self.min_ref_size)
-            can_hold = (not is_border) and (end_speed < 0.40 * ref_size)
-            actual_hold = self.hold_frames if can_hold else 0
-
-            end = min(n_frames - 1, last + actual_hold)
+            # Extend each segment with a few frames on both sides, using the nearest box.
+            # The detector typically fires a few frames after a face appears and stops a few
+            # frames before it leaves (including through a frame border): over-masking a
+            # stale area is harmless, a visible face is not.
+            start = max(0, first - self.lead_frames)
+            end = min(n_frames - 1, last + self.hold_frames)
+            parts = []
+            if start < first:
+                parts.append(np.repeat(interp[:1], first - start, axis=0))
+            parts.append(interp)
             if end > last:
-                post = np.repeat(interp[-1:], end - last, axis=0)
-                seq = np.vstack([interp, post])
-            else:
-                seq = interp
+                parts.append(np.repeat(interp[-1:], end - last, axis=0))
+            seq = np.vstack(parts)
 
             # Apply 3-point centered smoothing [0.20, 0.60, 0.20] to suppress pixel-quantization jitter
             if len(seq) >= 3:
@@ -304,7 +289,7 @@ class PersistentTracker:
                     smoothed_seq[:, coord_i] = np.convolve(padded, kernel, mode='valid')
                 seq = smoothed_seq
 
-            idx = np.arange(first, end + 1)
+            idx = np.arange(start, end + 1)
             detected = set(seg_frames)
             for k_idx, fr in enumerate(idx):
                 fr_int = int(fr)
