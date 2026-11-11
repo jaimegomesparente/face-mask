@@ -387,8 +387,12 @@ def safe_stem(filename: str) -> str:
     return stem or "video"
 
 
-def get_input_video_path(uploaded) -> str:
-    """Write the upload to disk once per file, not on every Streamlit rerun."""
+def get_session_paths(uploaded) -> tuple:
+    """
+    Write the upload to disk once per file, not on every Streamlit rerun.
+    Input and output paths are unique per upload, so concurrent sessions never
+    read, overwrite or delete each other's files.
+    """
     if st.session_state.get("upload_id") != uploaded.file_id:
         # New upload: drop the previous temp files before writing the new one
         _remove_quietly(st.session_state.get("input_path"))
@@ -397,15 +401,16 @@ def get_input_video_path(uploaded) -> str:
         fd, path = tempfile.mkstemp(prefix="facemask_in_", suffix=suffix)
         with os.fdopen(fd, "wb") as f:
             f.write(uploaded.getbuffer())
+        out_fd, out_path = tempfile.mkstemp(prefix="facemask_out_", suffix=".mp4")
+        os.close(out_fd)
         st.session_state["upload_id"] = uploaded.file_id
         st.session_state["input_path"] = path
-        st.session_state["output_path"] = None
-    return st.session_state["input_path"]
+        st.session_state["output_path"] = out_path
+    return st.session_state["input_path"], st.session_state["output_path"]
 
 
 if uploaded_file is not None:
-    temp_dir = tempfile.gettempdir()
-    input_video_path = get_input_video_path(uploaded_file)
+    input_video_path, output_video_path = get_session_paths(uploaded_file)
 
     # Metadata extraction
     cap = cv2.VideoCapture(input_video_path)
@@ -498,10 +503,8 @@ if uploaded_file is not None:
     # Section 02 : Render & Export
     st.markdown('<div class="section-bar"><span>Render & Export</span></div>', unsafe_allow_html=True)
 
-    # uploaded_file.name is client-controlled (may contain "..\\" etc.): never use it raw in a path
+    # Download name only: uploaded_file.name is client-controlled, never use it in a path
     output_filename = f"masked_{safe_stem(uploaded_file.name)}.mp4"
-    output_video_path = os.path.join(temp_dir, output_filename)
-    st.session_state["output_path"] = output_video_path
 
     if st.button("● Record & Process Video", use_container_width=True):
         progress_bar = st.progress(0, text="Initializing...")
