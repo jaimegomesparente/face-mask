@@ -3,6 +3,8 @@ gatherUsageStats = false
 
 [server]
 headless = false
+# Listen on the loopback interface only: the app must not be reachable from the network
+address = "localhost"
 port = 8501
 maxUploadSize = 2048
 
