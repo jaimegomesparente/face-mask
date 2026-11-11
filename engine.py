@@ -341,6 +341,9 @@ class FaceMasker:
     """Core face detection, masking, and persistent ID visualization engine."""
 
     DEFAULT_PIXEL_SIZE = 16
+    # Maximum number of mosaic blocks along the longest side of a masked region.
+    # Keeps large (close-up) faces from staying recognizable behind a fine mosaic.
+    MAX_MOSAIC_BLOCKS = 10
     DEFAULT_PADDING_RATIO = 0.22
     DEFAULT_BOX_COLOR = (60, 255, 0)
     DEFAULT_BOX_THICKNESS = 1
@@ -437,10 +440,14 @@ class FaceMasker:
         roi = image[y1:y2, x1:x2]
         roi_h, roi_w = roi.shape[:2]
 
-        small_w = max(1, roi_w // pixel_size)
-        small_h = max(1, roi_h // pixel_size)
+        # Block size grows with the region so a face never gets more than
+        # MAX_MOSAIC_BLOCKS blocks across, whatever its size on screen.
+        block = max(pixel_size, math.ceil(max(roi_w, roi_h) / FaceMasker.MAX_MOSAIC_BLOCKS))
+        small_w = max(1, roi_w // block)
+        small_h = max(1, roi_h // block)
 
-        small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+        # INTER_AREA averages every pixel of a block (INTER_LINEAR only samples a few)
+        small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_AREA)
         pixelated = cv2.resize(small, (roi_w, roi_h), interpolation=cv2.INTER_NEAREST)
 
         image[y1:y2, x1:x2] = pixelated
