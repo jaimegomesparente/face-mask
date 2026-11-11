@@ -11,11 +11,45 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
-import cv2
+# Restrict OpenCV's FFmpeg backend to local files: a crafted "video" (e.g. an HLS
+# playlist disguised as .mp4) must not make the demuxer open other files or URLs.
+# Read by OpenCV each time a capture is opened.
+_cv_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "")
+if "protocol_whitelist" not in _cv_opts:
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(filter(None, [_cv_opts, "protocol_whitelist;file"]))
+
+import cv2  # noqa: E402
 import numpy as np
 
 BBox = Tuple[int, int, int, int]
 FBox = Tuple[float, float, float, float]
+
+# Container formats accepted as input, as reported by ffprobe (format_name).
+ALLOWED_CONTAINERS = {
+    "mov,mp4,m4a,3gp,3g2,mj2",
+    "matroska,webm",
+    "avi",
+}
+
+
+def check_input_container(path: str) -> str:
+    """
+    Probe the real container format of a file (by content, not extension) and reject
+    anything other than MP4/MOV, MKV/WebM or AVI, e.g. playlists or concat scripts
+    renamed to .mp4.
+    """
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-protocol_whitelist", "file",
+        "-show_entries", "format=format_name",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        os.path.abspath(path),
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    fmt = res.stdout.strip()
+    if res.returncode != 0 or fmt not in ALLOWED_CONTAINERS:
+        raise ValueError(f"Unsupported or invalid video container: {fmt or res.stderr.strip() or 'unknown'}")
+    return fmt
 
 
 @dataclass
@@ -602,6 +636,7 @@ class FaceMasker:
     ) -> str:
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Input video not found: {input_path}")
+        check_input_container(input_path)
 
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
@@ -690,10 +725,17 @@ class FaceMasker:
 
     @staticmethod
     def _mux_audio_with_ffmpeg(processed_video_path: str, original_video_path: str, output_path: str) -> None:
+        # Absolute paths: never start with "-" (option injection) and never parsed as
+        # a protocol; inputs restricted to local files.
+        processed_video_path = os.path.abspath(processed_video_path)
+        original_video_path = os.path.abspath(original_video_path)
+        output_path = os.path.abspath(output_path)
         cmd = [
             "ffmpeg",
             "-y",
+            "-protocol_whitelist", "file",
             "-i", processed_video_path,
+            "-protocol_whitelist", "file",
             "-i", original_video_path,
             "-c:v", "libx264",
             "-preset", "fast",
@@ -711,7 +753,9 @@ class FaceMasker:
             cmd_fallback = [
                 "ffmpeg",
                 "-y",
+                "-protocol_whitelist", "file",
                 "-i", processed_video_path,
+                "-protocol_whitelist", "file",
                 "-i", original_video_path,
                 "-c:v", "copy",
                 "-c:a", "copy",

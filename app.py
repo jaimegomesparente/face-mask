@@ -13,7 +13,7 @@ import tempfile
 import time
 import cv2
 import streamlit as st
-from engine import FaceMasker
+from engine import FaceMasker, check_input_container
 
 
 # Page configuration
@@ -411,6 +411,13 @@ def get_session_paths(uploaded) -> tuple:
 
 if uploaded_file is not None:
     input_video_path, output_video_path = get_session_paths(uploaded_file)
+
+    # Validate the real container (by content) before OpenCV / ffmpeg parse it
+    try:
+        check_input_container(input_video_path)
+    except (ValueError, OSError) as e:
+        st.error(f"Rejected file: {e}")
+        st.stop()
 
     # Metadata extraction
     cap = cv2.VideoCapture(input_video_path)
