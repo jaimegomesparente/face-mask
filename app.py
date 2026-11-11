@@ -420,7 +420,9 @@ def get_session_paths(uploaded) -> tuple:
         _remove_quietly(st.session_state.get("output_path"))
         os.makedirs(TEMP_DIR, exist_ok=True)
         purge_stale_files()
-        suffix = os.path.splitext(uploaded.name)[1] or ".mp4"
+        # Client-controlled name: only reuse the extension if it is a known one
+        ext = os.path.splitext(uploaded.name)[1].lower()
+        suffix = ext if ext in (".mp4", ".mov", ".avi", ".mkv") else ".mp4"
         fd, path = tempfile.mkstemp(prefix="facemask_in_", suffix=suffix, dir=TEMP_DIR)
         with os.fdopen(fd, "wb") as f:
             f.write(uploaded.getbuffer())
