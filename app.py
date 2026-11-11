@@ -371,6 +371,27 @@ uploaded_file = st.file_uploader(
     label_visibility="collapsed"
 )
 
+# Uploaded (non-anonymized) videos and outputs live in a dedicated folder and are
+# purged after a while: Streamlit has no reliable session-end hook to delete them.
+TEMP_DIR = os.path.join(tempfile.gettempdir(), "face-masker")
+STALE_FILE_AGE_SEC = 6 * 3600
+
+
+def purge_stale_files() -> None:
+    now = time.time()
+    try:
+        names = os.listdir(TEMP_DIR)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(TEMP_DIR, name)
+        try:
+            if name.startswith("facemask_") and now - os.path.getmtime(path) > STALE_FILE_AGE_SEC:
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def _remove_quietly(path):
     if path and os.path.exists(path):
         try:
@@ -397,11 +418,13 @@ def get_session_paths(uploaded) -> tuple:
         # New upload: drop the previous temp files before writing the new one
         _remove_quietly(st.session_state.get("input_path"))
         _remove_quietly(st.session_state.get("output_path"))
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        purge_stale_files()
         suffix = os.path.splitext(uploaded.name)[1] or ".mp4"
-        fd, path = tempfile.mkstemp(prefix="facemask_in_", suffix=suffix)
+        fd, path = tempfile.mkstemp(prefix="facemask_in_", suffix=suffix, dir=TEMP_DIR)
         with os.fdopen(fd, "wb") as f:
             f.write(uploaded.getbuffer())
-        out_fd, out_path = tempfile.mkstemp(prefix="facemask_out_", suffix=".mp4")
+        out_fd, out_path = tempfile.mkstemp(prefix="facemask_out_", suffix=".mp4", dir=TEMP_DIR)
         os.close(out_fd)
         st.session_state["upload_id"] = uploaded.file_id
         st.session_state["input_path"] = path
