@@ -493,8 +493,9 @@ class FaceMasker:
         pixel_size: int,
         box_color_bgr: Tuple[int, int, int],
         box_thickness: int
-    ) -> None:
-        # 1. Pixelate only the face area with adaptive margin for motion and profile turns
+    ) -> int:
+        # 1. Pixelate every box, overlapping ones included: pixelating twice is harmless,
+        #    dropping a box could leave part of a face visible.
         for ((fx, fy, fw, fh), _), _, _ in boxes:
             pad_x = max(int(fw * 0.18), int(fh * 0.12))
             pad_y = int(fh * 0.12)
@@ -504,11 +505,13 @@ class FaceMasker:
             py2 = min(image.shape[0], fy + fh + int(1.25 * pad_y))
             self.apply_pixelation(image, px1, py1, px2 - px1, py2 - py1, pixel_size=pixel_size)
 
-        # 2. Draw thin green head tracking box + ID badge
-        for (_, (hx, hy, hw, hh)), track_id, _ in boxes:
+        # 2. Draw thin green head tracking box + ID badge, deduplicated (overlay only)
+        drawn = self._dedupe_frame_boxes(boxes)
+        for (_, (hx, hy, hw, hh)), track_id, _ in drawn:
             self.draw_tracking_box(image, hx, hy, hw, hh, color_bgr=box_color_bgr, thickness=box_thickness)
             if track_id is not None:
                 self.draw_id_badge(image, hx, hy, track_id, color_bgr=box_color_bgr)
+        return len(drawn)
 
     @staticmethod
     def _iou(b1, b2) -> float:
@@ -526,8 +529,9 @@ class FaceMasker:
         boxes: List[Tuple[Tuple[BBox, BBox], Optional[int], bool]]
     ) -> List[Tuple[Tuple[BBox, BBox], Optional[int], bool]]:
         """
-        Guarantees that no two boxes overlap on the same person on the same frame.
+        Guarantees that no two overlay boxes are drawn on the same person on the same frame.
         Real YOLO detections always take priority over interpolated ones.
+        Only used for drawing: pixelation is always applied to every box.
         """
         if len(boxes) <= 1:
             return boxes
@@ -571,9 +575,8 @@ class FaceMasker:
             head_box = self.expand_bbox_for_head(d.bbox, out_frame.shape, padding_ratio)
             boxes.append((((fx, fy, fw, fh), head_box), i + 1, True))
 
-        boxes = self._dedupe_frame_boxes(boxes)
-        self._render(out_frame, boxes, pixel_size, box_color_bgr, box_thickness)
-        return out_frame, len(boxes)
+        face_count = self._render(out_frame, boxes, pixel_size, box_color_bgr, box_thickness)
+        return out_frame, face_count
 
     def _scan_video(
         self,
@@ -676,7 +679,6 @@ class FaceMasker:
                         for i, d in enumerate(dets)
                     ]
 
-                boxes = self._dedupe_frame_boxes(boxes)
                 self._render(frame, boxes, pixel_size, box_color_bgr, box_thickness)
                 writer.write(frame)
                 frame_idx += 1
