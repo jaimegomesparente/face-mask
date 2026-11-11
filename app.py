@@ -8,6 +8,7 @@ Minimalist terminalesque UI with authentic camcorder touches:
 """
 
 import os
+import re
 import tempfile
 import time
 import cv2
@@ -378,6 +379,14 @@ def _remove_quietly(path):
             pass
 
 
+def safe_stem(filename: str) -> str:
+    """Client-supplied upload name -> bare file stem with no path or special characters."""
+    base = os.path.basename(filename.replace("\\", "/"))
+    stem = os.path.splitext(base)[0]
+    stem = re.sub(r"[^\w\-. ]", "_", stem).strip(" .")
+    return stem or "video"
+
+
 def get_input_video_path(uploaded) -> str:
     """Write the upload to disk once per file, not on every Streamlit rerun."""
     if st.session_state.get("upload_id") != uploaded.file_id:
@@ -489,9 +498,8 @@ if uploaded_file is not None:
     # Section 02 : Render & Export
     st.markdown('<div class="section-bar"><span>Render & Export</span></div>', unsafe_allow_html=True)
 
-    output_filename = f"masked_{uploaded_file.name}"
-    if not output_filename.endswith(".mp4"):
-        output_filename = os.path.splitext(output_filename)[0] + ".mp4"
+    # uploaded_file.name is client-controlled (may contain "..\\" etc.): never use it raw in a path
+    output_filename = f"masked_{safe_stem(uploaded_file.name)}.mp4"
     output_video_path = os.path.join(temp_dir, output_filename)
     st.session_state["output_path"] = output_video_path
 
