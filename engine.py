@@ -764,4 +764,12 @@ class FaceMasker:
                 "-map", "1:a:0?",
                 output_path
             ]
-            subprocess.run(cmd_fallback, check=True)
+            res_fb = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res_fb.returncode != 0:
+                def tail(text: str) -> str:
+                    return "\n".join(text.strip().splitlines()[-5:])
+                raise RuntimeError(
+                    "FFmpeg failed to encode the output video.\n"
+                    f"libx264 attempt:\n{tail(res.stderr)}\n"
+                    f"stream copy fallback:\n{tail(res_fb.stderr)}"
+                )
