@@ -334,7 +334,7 @@ def format_timecode(frame_num: int, frame_rate: float) -> str:
     h = int(total_sec // 3600)
     m = int((total_sec % 3600) // 60)
     s = int(total_sec % 60)
-    f = int(frame_num % int(frame_rate if frame_rate > 0 else 25))
+    f = int(frame_num % max(1, round(frame_rate)))
     return f"{h:02d}:{m:02d}:{s:02d}:{f:02d}"
 
 
