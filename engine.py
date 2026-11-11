@@ -207,9 +207,16 @@ class PersistentTracker:
 
         return tracklets
 
-    def _keep(self, t: dict) -> bool:
+    def _keep(self, t: dict, conf_threshold: Optional[float] = None) -> bool:
         scores = [s for _, s in t['obs'].values()]
         n = len(scores)
+        mx = max(scores)
+
+        # Anonymization must never mask less than the per-frame preview: any track
+        # containing a detection above the user's threshold is always kept.
+        if conf_threshold is not None and mx >= conf_threshold:
+            return True
+
         if n < self.min_hits:
             return False
         frames = sorted(t['obs'].keys())
@@ -219,7 +226,6 @@ class PersistentTracker:
         if span > 10 and hit_rate < 0.25:
             return False
 
-        mx = max(scores)
         mean = sum(scores) / n
         return mx >= self.high_conf or (n >= 4 and mean >= self.profile_conf)
 
@@ -307,14 +313,27 @@ class PersistentTracker:
 
         return out_tracks
 
-    def build(self, per_frame: List[List[Detection]], frame_size: Tuple[int, int] = (0, 0)) -> Dict[int, List[Tuple[FBox, int, bool]]]:
+    def build(
+        self,
+        per_frame: List[List[Detection]],
+        frame_size: Tuple[int, int] = (0, 0),
+        conf_threshold: Optional[float] = None
+    ) -> Dict[int, List[Tuple[FBox, Optional[int], bool]]]:
         n = len(per_frame)
-        out: Dict[int, List[Tuple[FBox, int, bool]]] = {}
+        out: Dict[int, List[Tuple[FBox, Optional[int], bool]]] = {}
         for t in self._link(per_frame):
-            if not self._keep(t):
+            if not self._keep(t, conf_threshold):
                 continue
             for fr, bbox, track_id, det in self._expand_track(t, n, frame_size):
                 out.setdefault(fr, []).append((bbox, track_id, det))
+
+        # Safety net: every raw detection above the user's threshold is masked on its
+        # own frame, even if the linker dropped it (e.g. suppressed next to another track).
+        if conf_threshold is not None:
+            for fr, dets in enumerate(per_frame):
+                for d in dets:
+                    if d.reject is None and d.score >= conf_threshold:
+                        out.setdefault(fr, []).append((d.bbox, None, True))
         return out
 
 
@@ -610,7 +629,7 @@ class FaceMasker:
         masks: Dict[int, List[Tuple[FBox, int, bool]]] = {}
         if use_tracking:
             per_frame = self._scan_video(input_path, conf_threshold, progress_callback, total_frames)
-            masks = PersistentTracker().build(per_frame, frame_size=(width, height))
+            masks = PersistentTracker().build(per_frame, frame_size=(width, height), conf_threshold=conf_threshold)
 
         # ---- Pass 2: Rendering & Export ----
         temp_dir = tempfile.gettempdir()
