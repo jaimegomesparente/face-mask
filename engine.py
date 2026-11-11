@@ -7,6 +7,7 @@ import math
 import os
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -338,6 +339,9 @@ class FaceMasker:
 
         self.model_path = model_path
         self.is_yolo = "yolo" in os.path.basename(model_path).lower()
+        # cv2.dnn networks / FaceDetectorYN are not thread-safe (setInput + forward).
+        # Streamlit shares this instance across sessions, each running in its own thread.
+        self._lock = threading.Lock()
         if self.is_yolo:
             self._detector = YOLOv8FaceDetector(model_path, conf_thresh=self.DEFAULT_CONF_THRESHOLD)
         else:
@@ -363,6 +367,10 @@ class FaceMasker:
         return self._detector
 
     def detect_faces(self, frame: np.ndarray, conf_threshold: float = DEFAULT_CONF_THRESHOLD) -> List[Detection]:
+        with self._lock:
+            return self._detect_faces_unlocked(frame, conf_threshold)
+
+    def _detect_faces_unlocked(self, frame: np.ndarray, conf_threshold: float) -> List[Detection]:
         if self.is_yolo:
             return self._detector.detect(frame, conf_threshold=conf_threshold)
 
