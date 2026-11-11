@@ -657,8 +657,9 @@ class FaceMasker:
             masks = PersistentTracker().build(per_frame, frame_size=(width, height), conf_threshold=conf_threshold)
 
         # ---- Pass 2: Rendering & Export ----
-        temp_dir = tempfile.gettempdir()
-        temp_video_path = os.path.join(temp_dir, f"temp_video_{os.getpid()}_{np.random.randint(10000, 99999)}.mp4")
+        # Unique, unpredictable, atomically created temp file (only readable by the user on POSIX)
+        temp_fd, temp_video_path = tempfile.mkstemp(prefix="facemask_render_", suffix=".mp4")
+        os.close(temp_fd)
 
         cap = cv2.VideoCapture(input_path)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
