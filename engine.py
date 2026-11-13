@@ -144,6 +144,10 @@ class YOLOv8FaceDetector:
     Robust to profile angles, motion blur, and variable lighting.
     """
 
+    # Detections with a side below this many pixels are dropped. Kept low on purpose:
+    # on crowd footage a 10 px floor left a third of the 7-9 px faces unmasked.
+    MIN_FACE_SIZE = 6.0
+
     def __init__(
         self,
         model_path: str,
@@ -219,7 +223,7 @@ class YOLOv8FaceDetector:
         for idx in indices:
             i = idx[0] if isinstance(idx, (list, np.ndarray)) else idx
             bx, by, bw, bh = boxes[i]
-            if min(bw, bh) < 10.0:
+            if min(bw, bh) < self.MIN_FACE_SIZE:
                 continue
             results.append(Detection(bbox=(float(bx), float(by), float(bw), float(bh)), score=scores[i]))
 
