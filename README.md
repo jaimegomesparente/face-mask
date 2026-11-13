@@ -39,6 +39,8 @@ The application opens in your web browser:
 1. Select your video file (MP4, MOV, AVI, MKV).
 2. Preview timeline and inspect detection.
 3. Click "Process Video" and download the final MP4.
+4. Optional: the table under the result lists every ID found (thumbnail, first and last appearance).
+   Untick the IDs to leave unmasked and click "Process Again": only the rendering is redone, not the detection.
 
 ---
 
@@ -53,6 +55,8 @@ Options:
 - `-o, --output`: output path (default: `<name>_masked.mp4`).
 - `--conf`: detection confidence threshold (default: 0.30).
 - `--no-tracking`: disable temporal tracking and smoothing (per-frame detection only).
+- `--list-ids`: print the table of IDs found (when each one is on screen).
+- `--exclude-ids`: leave these IDs unmasked, e.g. `--exclude-ids 3,7` (see below).
 - `--small-faces`: also detect on two overlapping halves of each frame. Catches the tiny faces of crowds and wide shots (under ~10 px), about 3x slower.
 - `--reid`: keep the same ID when a person leaves the frame and comes back (off by default, see below).
 - `--start`, `--end`: only mask faces between these times (seconds, `MM:SS` or `HH:MM:SS`). Either can be omitted. Faces outside this portion stay visible.
@@ -60,6 +64,19 @@ Options:
 ```powershell
 python cli.py my_video.mp4 --start 0:12 --end 0:45.5
 ```
+
+### Leaving some people unmasked (optional)
+
+Each tracked face carries an ID, shown on its badge in the output video. To leave some of them visible:
+
+```powershell
+python cli.py my_video.mp4 --list-ids            # first run: prints the table of IDs
+python cli.py my_video.mp4 --exclude-ids 3,7     # second run: IDs 3 and 7 stay visible
+```
+
+- IDs are the same from one run to the next as long as the other options are unchanged.
+- A person whose tracking was interrupted can have several IDs: exclude each of them, or use `--reid` to merge them.
+- Not available with `--no-tracking`.
 
 ### Persistent IDs (optional)
 

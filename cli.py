@@ -25,6 +25,22 @@ def parse_time(value: str) -> float:
     return seconds
 
 
+def parse_ids(value: str) -> list:
+    """ "3,7,12" -> [3, 7, 12] """
+    try:
+        ids = [int(p) for p in value.replace(" ", "").split(",") if p]
+    except ValueError:
+        ids = []
+    if not ids or any(i < 1 for i in ids):
+        raise argparse.ArgumentTypeError(f"invalid ID list '{value}' (use e.g. 3,7,12)")
+    return ids
+
+
+def format_time(frame: int, fps: float) -> str:
+    seconds = frame / fps if fps > 0 else 0.0
+    return f"{int(seconds // 60):02d}:{seconds % 60:05.2f}"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Face Masker - Face anonymization for video."
@@ -49,7 +65,18 @@ def parse_args():
         "--end", type=parse_time, default=None, metavar="TIME",
         help="Only mask faces up to this time (seconds, MM:SS or HH:MM:SS; default: end of video)"
     )
+    parser.add_argument(
+        "--list-ids", action="store_true",
+        help="Print the table of IDs found in the video (when each one is on screen)"
+    )
+    parser.add_argument(
+        "--exclude-ids", type=parse_ids, default=None, metavar="IDS",
+        help="Leave these IDs unmasked, e.g. 3,7,12. IDs are the ones shown on the badges of a "
+             "previous run with the same options (see --list-ids)"
+    )
     args = parser.parse_args()
+    if args.exclude_ids and args.no_tracking:
+        parser.error("--exclude-ids needs tracking: it cannot be combined with --no-tracking")
     if args.start is not None and args.end is not None and args.end <= args.start:
         parser.error("--end must be after --start")
     if args.reid and args.no_tracking:
@@ -92,18 +119,43 @@ def main():
         pbar.update(current - pbar.n)
 
     try:
-        masker.process_video(
+        use_tracking = not args.no_tracking
+        analysis = masker.analyze_video(
             input_path=args.input,
-            output_path=output_path,
             conf_threshold=args.conf,
-            use_tracking=not args.no_tracking,
+            use_tracking=use_tracking,
             reidentify=args.reid,
             small_faces=args.small_faces,
             mask_range=mask_range,
             progress_callback=on_progress
         )
+        known = {t.track_id for t in analysis.tracks}
+        unknown = sorted(set(args.exclude_ids or ()) - known)
+        total = analysis.total_frames
+        masker.render_video(
+            analysis,
+            output_path,
+            exclude_ids=args.exclude_ids,
+            progress_callback=on_progress,
+            progress_offset=total if use_tracking else 0,
+            progress_total=total * 2 if use_tracking else total
+        )
         if pbar:
             pbar.close()
+
+        if use_tracking:
+            excluded = set(args.exclude_ids or ()) & known
+            if args.list_ids:
+                print(f"\n{'ID':>5}  {'First seen':>10}  {'Last seen':>10}  {'Frames':>6}  Status")
+                for t in analysis.tracks:
+                    status = "visible" if t.track_id in excluded else "masked"
+                    print(
+                        f"{t.track_id:>5}  {format_time(t.first_frame, analysis.fps):>10}  "
+                        f"{format_time(t.last_frame, analysis.fps):>10}  {t.n_frames:>6}  {status}"
+                    )
+            print(f"\nIDs found: {len(known)}, left unmasked: {len(excluded)}")
+            if unknown:
+                print(f"[WARNING] Unknown IDs ignored: {', '.join(map(str, unknown))}", file=sys.stderr)
         elapsed = time.time() - start_time
         print(f"\n[SUCCESS] Anonymized video created with preserved audio: {output_path} ({elapsed:.1f}s)")
     except Exception as e:

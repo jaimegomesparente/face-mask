@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 # Restrict OpenCV's FFmpeg backend to local files: a crafted "video" (e.g. an HLS
 # playlist disguised as .mp4) must not make the demuxer open other files or URLs.
@@ -572,6 +572,34 @@ class PersistentTracker:
         return out
 
 
+@dataclass
+class TrackInfo:
+    """Summary of one ID over the masked part of a video."""
+    track_id: int
+    first_frame: int
+    last_frame: int
+    n_frames: int       # frames on which this ID is masked
+    thumb_frame: int    # frame and box used to show who this ID is
+    thumb_bbox: FBox
+
+
+@dataclass
+class VideoAnalysis:
+    """Result of the detection/tracking pass, enough to render the video several times."""
+    input_path: str
+    fps: float
+    width: int
+    height: int
+    total_frames: int
+    use_tracking: bool
+    conf_threshold: float
+    small_faces: bool
+    first_masked: int      # frames to mask, inclusive
+    last_masked: float     # int, or math.inf for "until the end"
+    masks: Dict[int, List[Tuple[FBox, Optional[int], bool]]]
+    tracks: List[TrackInfo]
+
+
 class FaceMasker:
     """Core face detection, masking, and persistent ID visualization engine."""
 
@@ -912,23 +940,20 @@ class FaceMasker:
             cap.release()
         return per_frame
 
-    def process_video(
+    def analyze_video(
         self,
         input_path: str,
-        output_path: str,
-        pixel_size: int = DEFAULT_PIXEL_SIZE,
-        padding_ratio: float = DEFAULT_PADDING_RATIO,
-        box_color_bgr: Tuple[int, int, int] = DEFAULT_BOX_COLOR,
-        box_thickness: int = DEFAULT_BOX_THICKNESS,
         conf_threshold: float = DEFAULT_CONF_THRESHOLD,
         use_tracking: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
-        debug: bool = False,
         reidentify: bool = False,
         mask_range: Optional[Tuple[Optional[float], Optional[float]]] = None,
         small_faces: bool = False
-    ) -> str:
+    ) -> VideoAnalysis:
         """
+        First pass: detect and track faces, without writing anything. The result can be
+        rendered several times (see render_video), e.g. to leave some IDs unmasked.
+
         small_faces: also detect on two overlapping halves of each frame. About 3x
         slower, but catches the tiny faces of crowds and wide shots.
         reidentify: keep the same ID for a person who leaves the frame and comes back
@@ -965,11 +990,10 @@ class FaceMasker:
         last_masked = math.inf if math.isinf(range_end) else int(math.ceil(range_end * fps))
         partial = mask_range is not None and (first_masked > 0 or not math.isinf(last_masked))
 
-        # ---- Pass 1: Detection & Multi-Object Tracking ----
-        masks: Dict[int, List[Tuple[FBox, int, bool]]] = {}
+        masks: Dict[int, List[Tuple[FBox, Optional[int], bool]]] = {}
         if use_tracking:
             # Scan a little beyond the portion so tracks at its edges are as solid as
-            # in a full scan; rendering is clipped to the exact portion below.
+            # in a full scan; rendering is clipped to the exact portion.
             margin = PersistentTracker().max_gap
             scan_range = (first_masked - margin, last_masked + margin) if partial else None
             per_frame = self._scan_video(
@@ -980,9 +1004,85 @@ class FaceMasker:
                 merge_ids=embedder is not None
             )
 
-        # ---- Pass 2: Rendering & Export ----
-        offset = total_frames if use_tracking else 0
-        denom = total_frames * 2 if use_tracking else total_frames
+        # One summary per ID, limited to the frames that are actually masked
+        seen: Dict[int, dict] = {}
+        for fr in sorted(masks):
+            if not (first_masked <= fr <= last_masked):
+                continue
+            for bbox, track_id, det in masks[fr]:
+                if track_id is None:
+                    continue
+                t = seen.setdefault(track_id, {'first': fr, 'last': fr, 'n': 0, 'best': (-1.0, fr, bbox)})
+                t['last'] = fr
+                t['n'] += 1
+                # Thumbnail: the largest box that is a real detection (not interpolated)
+                area = bbox[2] * bbox[3] if det else 0.0
+                if area > t['best'][0]:
+                    t['best'] = (area, fr, bbox)
+        tracks = [
+            TrackInfo(track_id, t['first'], t['last'], t['n'], t['best'][1], t['best'][2])
+            for track_id, t in sorted(seen.items())
+        ]
+
+        return VideoAnalysis(
+            input_path=input_path, fps=fps, width=width, height=height, total_frames=total_frames,
+            use_tracking=use_tracking, conf_threshold=conf_threshold, small_faces=small_faces,
+            first_masked=first_masked, last_masked=last_masked, masks=masks, tracks=tracks
+        )
+
+    @staticmethod
+    def _boxes_without_ids(
+        raw: List[Tuple[FBox, Optional[int], bool]],
+        exclude_ids: set
+    ) -> List[Tuple[FBox, Optional[int], bool]]:
+        """
+        Boxes of one frame once some IDs are left unmasked. Besides the tracked boxes of
+        these IDs, the untracked safety-net boxes sitting on the same face are dropped,
+        unless they also sit on a face that must stay masked.
+        """
+        excluded = [b for b, tid, _ in raw if tid in exclude_ids]
+        if not excluded:
+            return raw
+        kept_tracked = [b for b, tid, _ in raw if tid is not None and tid not in exclude_ids]
+
+        def on(box: FBox, others: List[FBox]) -> bool:
+            cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+            return any(o[0] <= cx <= o[0] + o[2] and o[1] <= cy <= o[1] + o[3] for o in others)
+
+        return [
+            (b, tid, det) for b, tid, det in raw
+            if tid not in exclude_ids and not (tid is None and on(b, excluded) and not on(b, kept_tracked))
+        ]
+
+    def render_video(
+        self,
+        analysis: VideoAnalysis,
+        output_path: str,
+        pixel_size: int = DEFAULT_PIXEL_SIZE,
+        padding_ratio: float = DEFAULT_PADDING_RATIO,
+        box_color_bgr: Tuple[int, int, int] = DEFAULT_BOX_COLOR,
+        box_thickness: int = DEFAULT_BOX_THICKNESS,
+        exclude_ids: Optional[Iterable[int]] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        progress_offset: int = 0,
+        progress_total: Optional[int] = None
+    ) -> str:
+        """
+        Second pass: write the masked video from an analysis.
+        exclude_ids: IDs whose face is left visible (needs an analysis made with tracking).
+        """
+        an = analysis
+        excluded = set(exclude_ids or ())
+        if excluded and not an.use_tracking:
+            raise ValueError("IDs can only be left unmasked when tracking is enabled")
+        input_path = an.input_path
+        denom = progress_total if progress_total is not None else an.total_frames
+
+        def as_render_box(bbox: FBox, frame: np.ndarray):
+            return (
+                (int(round(bbox[0])), int(round(bbox[1])), int(round(bbox[2])), int(round(bbox[3]))),
+                self.expand_bbox_for_head(bbox, frame.shape, padding_ratio)
+            )
 
         def render_all(write: Callable[[np.ndarray], None]) -> None:
             cap = cv2.VideoCapture(input_path)
@@ -993,34 +1093,18 @@ class FaceMasker:
                     if not ret:
                         break
 
-                    if not (first_masked <= frame_idx <= last_masked):
+                    if not (an.first_masked <= frame_idx <= an.last_masked):
                         boxes = []
-                    elif use_tracking:
-                        raw_tracks = masks.get(frame_idx, [])
-                        boxes = [
-                            (
-                                (
-                                    (int(round(b[0])), int(round(b[1])), int(round(b[2])), int(round(b[3]))),
-                                    self.expand_bbox_for_head(b, frame.shape, padding_ratio)
-                                ),
-                                track_id,
-                                det
-                            )
-                            for b, track_id, det in raw_tracks
-                        ]
+                    elif an.use_tracking:
+                        raw = an.masks.get(frame_idx, [])
+                        if excluded:
+                            raw = self._boxes_without_ids(raw, excluded)
+                        boxes = [(as_render_box(b, frame), track_id, det) for b, track_id, det in raw]
                     else:
-                        dets = self.detect_faces(frame, conf_threshold=conf_threshold, small_faces=small_faces)
-                        boxes = [
-                            (
-                                (
-                                    (int(round(d.bbox[0])), int(round(d.bbox[1])), int(round(d.bbox[2])), int(round(d.bbox[3]))),
-                                    self.expand_bbox_for_head(d.bbox, frame.shape, padding_ratio)
-                                ),
-                                i + 1,
-                                True
-                            )
-                            for i, d in enumerate(dets)
-                        ]
+                        dets = self.detect_faces(
+                            frame, conf_threshold=an.conf_threshold, small_faces=an.small_faces
+                        )
+                        boxes = [(as_render_box(d.bbox, frame), i + 1, True) for i, d in enumerate(dets)]
 
                     if boxes:
                         self._render(frame, boxes, pixel_size, box_color_bgr, box_thickness)
@@ -1028,20 +1112,20 @@ class FaceMasker:
                     frame_idx += 1
 
                     if progress_callback and denom > 0:
-                        progress_callback(min(offset + frame_idx, denom), denom)
+                        progress_callback(min(progress_offset + frame_idx, denom), denom)
             finally:
                 cap.release()
 
         # Fast path: frames are piped straight into the final H.264 encode (one encode
         # instead of two, no intermediate file).
-        if self._encode_direct(render_all, input_path, output_path, fps, width, height):
+        if self._encode_direct(render_all, input_path, output_path, an.fps, an.width, an.height):
             return output_path
 
         # Fallback (e.g. libx264 unavailable, odd frame size): intermediate file, then mux.
         # Unique, unpredictable, atomically created temp file (only readable by the user on POSIX)
         temp_fd, temp_video_path = tempfile.mkstemp(prefix="facemask_render_", suffix=".mp4")
         os.close(temp_fd)
-        writer = cv2.VideoWriter(temp_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+        writer = cv2.VideoWriter(temp_video_path, cv2.VideoWriter_fourcc(*'mp4v'), an.fps, (an.width, an.height))
         try:
             try:
                 render_all(writer.write)
@@ -1056,6 +1140,78 @@ class FaceMasker:
                     pass
 
         return output_path
+
+    def track_thumbnails(self, analysis: VideoAnalysis, size: int = 72) -> Dict[int, np.ndarray]:
+        """
+        One small UNMASKED picture (BGR) of the head behind each ID, so a person can be
+        told from another when choosing which IDs to leave visible. Kept in memory only.
+        """
+        wanted: Dict[int, List[TrackInfo]] = {}
+        for t in analysis.tracks:
+            wanted.setdefault(t.thumb_frame, []).append(t)
+        thumbs: Dict[int, np.ndarray] = {}
+        if not wanted:
+            return thumbs
+        last_needed = max(wanted)
+        cap = cv2.VideoCapture(analysis.input_path)
+        frame_idx = 0
+        try:
+            while frame_idx <= last_needed and cap.grab():
+                if frame_idx in wanted:
+                    ok, frame = cap.retrieve()
+                    if not ok:
+                        break
+                    for t in wanted[frame_idx]:
+                        x, y, w, h = self.expand_bbox_for_head(t.thumb_bbox, frame.shape)
+                        crop = frame[y:y + h, x:x + w]
+                        if crop.size == 0:
+                            continue
+                        # Letterbox to a square so faces are not distorted
+                        scale = size / max(w, h)
+                        nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+                        small = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+                        canvas = np.zeros((size, size, 3), dtype=np.uint8)
+                        ox, oy = (size - nw) // 2, (size - nh) // 2
+                        canvas[oy:oy + nh, ox:ox + nw] = small
+                        thumbs[t.track_id] = canvas
+                frame_idx += 1
+        finally:
+            cap.release()
+        return thumbs
+
+    def process_video(
+        self,
+        input_path: str,
+        output_path: str,
+        pixel_size: int = DEFAULT_PIXEL_SIZE,
+        padding_ratio: float = DEFAULT_PADDING_RATIO,
+        box_color_bgr: Tuple[int, int, int] = DEFAULT_BOX_COLOR,
+        box_thickness: int = DEFAULT_BOX_THICKNESS,
+        conf_threshold: float = DEFAULT_CONF_THRESHOLD,
+        use_tracking: bool = True,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        debug: bool = False,
+        reidentify: bool = False,
+        mask_range: Optional[Tuple[Optional[float], Optional[float]]] = None,
+        small_faces: bool = False,
+        exclude_ids: Optional[Iterable[int]] = None
+    ) -> str:
+        """Analyze then render in one call. See analyze_video and render_video."""
+        if exclude_ids and not use_tracking:
+            raise ValueError("IDs can only be left unmasked when tracking is enabled")
+        analysis = self.analyze_video(
+            input_path, conf_threshold=conf_threshold, use_tracking=use_tracking,
+            progress_callback=progress_callback, reidentify=reidentify,
+            mask_range=mask_range, small_faces=small_faces
+        )
+        total = analysis.total_frames
+        return self.render_video(
+            analysis, output_path, pixel_size=pixel_size, padding_ratio=padding_ratio,
+            box_color_bgr=box_color_bgr, box_thickness=box_thickness, exclude_ids=exclude_ids,
+            progress_callback=progress_callback,
+            progress_offset=total if use_tracking else 0,
+            progress_total=total * 2 if use_tracking else total
+        )
 
     @staticmethod
     def _encode_direct(
