@@ -36,6 +36,17 @@ def parse_ids(value: str) -> list:
     return ids
 
 
+def parse_merges(value: str) -> list:
+    """ "3+7,12+15+20" -> [[3, 7], [12, 15, 20]] """
+    try:
+        groups = [[int(i) for i in g.split("+")] for g in value.replace(" ", "").split(",") if g]
+    except ValueError:
+        groups = []
+    if not groups or any(len(set(g)) < 2 or min(g) < 1 for g in groups):
+        raise argparse.ArgumentTypeError(f"invalid merge list '{value}' (use e.g. 3+7,12+15+20)")
+    return groups
+
+
 def format_time(frame: int, fps: float) -> str:
     seconds = frame / fps if fps > 0 else 0.0
     return f"{int(seconds // 60):02d}:{seconds % 60:05.2f}"
@@ -74,9 +85,15 @@ def parse_args():
         help="Leave these IDs unmasked, e.g. 3,7,12. IDs are the ones shown on the badges of a "
              "previous run with the same options (see --list-ids)"
     )
+    parser.add_argument(
+        "--merge-ids", type=parse_merges, default=None, metavar="GROUPS",
+        help="IDs that are the same person, e.g. 3+7,12+15+20: each group is shown under its lowest ID"
+    )
     args = parser.parse_args()
     if args.exclude_ids and args.no_tracking:
         parser.error("--exclude-ids needs tracking: it cannot be combined with --no-tracking")
+    if args.merge_ids and args.no_tracking:
+        parser.error("--merge-ids needs tracking: it cannot be combined with --no-tracking")
     if args.start is not None and args.end is not None and args.end <= args.start:
         parser.error("--end must be after --start")
     if args.reid and args.no_tracking:
@@ -129,6 +146,15 @@ def main():
             mask_range=mask_range,
             progress_callback=on_progress
         )
+        merge_notes = []
+        for group in args.merge_ids or []:
+            kept, together = masker.merge_ids(analysis, group)
+            merge_notes.append(f"IDs {'+'.join(map(str, sorted(set(group))))} merged into ID {kept}")
+            if together:
+                merge_notes.append(
+                    f"[WARNING] IDs {'+'.join(map(str, sorted(set(group))))} are on screen together on "
+                    f"{together} frame(s): they are probably different people"
+                )
         known = {t.track_id for t in analysis.tracks}
         unknown = sorted(set(args.exclude_ids or ()) - known)
         total = analysis.total_frames
@@ -154,6 +180,8 @@ def main():
                         f"{format_time(t.last_frame, analysis.fps):>10}  {t.n_frames:>6}  {status}"
                     )
             print(f"\nIDs found: {len(known)}, left unmasked: {len(excluded)}")
+            for note in merge_notes:
+                print(note)
             if unknown:
                 print(f"[WARNING] Unknown IDs ignored: {', '.join(map(str, unknown))}", file=sys.stderr)
         elapsed = time.time() - start_time

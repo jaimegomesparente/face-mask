@@ -8,7 +8,7 @@ import os
 import subprocess
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 # Restrict OpenCV's FFmpeg backend to local files: a crafted "video" (e.g. an HLS
@@ -598,6 +598,9 @@ class VideoAnalysis:
     last_masked: float     # int, or math.inf for "until the end"
     masks: Dict[int, List[Tuple[FBox, Optional[int], bool]]]
     tracks: List[TrackInfo]
+    # IDs merged by hand: {ID as tracked: ID shown}. masks keeps the IDs as tracked,
+    # so merges can be undone.
+    id_map: Dict[int, int] = field(default_factory=dict)
 
 
 class FaceMasker:
@@ -1004,31 +1007,77 @@ class FaceMasker:
                 merge_ids=embedder is not None
             )
 
-        # One summary per ID, limited to the frames that are actually masked
+        analysis = VideoAnalysis(
+            input_path=input_path, fps=fps, width=width, height=height, total_frames=total_frames,
+            use_tracking=use_tracking, conf_threshold=conf_threshold, small_faces=small_faces,
+            first_masked=first_masked, last_masked=last_masked, masks=masks, tracks=[]
+        )
+        analysis.tracks = self._summarize_tracks(analysis)
+        return analysis
+
+    @staticmethod
+    def _summarize_tracks(analysis: VideoAnalysis) -> List[TrackInfo]:
+        """One summary per shown ID, limited to the frames that are actually masked."""
         seen: Dict[int, dict] = {}
-        for fr in sorted(masks):
-            if not (first_masked <= fr <= last_masked):
+        for fr in sorted(analysis.masks):
+            if not (analysis.first_masked <= fr <= analysis.last_masked):
                 continue
-            for bbox, track_id, det in masks[fr]:
+            on_frame = set()
+            for bbox, track_id, det in analysis.masks[fr]:
                 if track_id is None:
                     continue
-                t = seen.setdefault(track_id, {'first': fr, 'last': fr, 'n': 0, 'best': (-1.0, fr, bbox)})
+                shown = analysis.id_map.get(track_id, track_id)
+                t = seen.setdefault(shown, {'first': fr, 'last': fr, 'n': 0, 'best': (-1.0, fr, bbox)})
                 t['last'] = fr
-                t['n'] += 1
+                if shown not in on_frame:
+                    on_frame.add(shown)
+                    t['n'] += 1
                 # Thumbnail: the largest box that is a real detection (not interpolated)
                 area = bbox[2] * bbox[3] if det else 0.0
                 if area > t['best'][0]:
                     t['best'] = (area, fr, bbox)
-        tracks = [
+        return [
             TrackInfo(track_id, t['first'], t['last'], t['n'], t['best'][1], t['best'][2])
             for track_id, t in sorted(seen.items())
         ]
 
-        return VideoAnalysis(
-            input_path=input_path, fps=fps, width=width, height=height, total_frames=total_frames,
-            use_tracking=use_tracking, conf_threshold=conf_threshold, small_faces=small_faces,
-            first_masked=first_masked, last_masked=last_masked, masks=masks, tracks=tracks
-        )
+    def merge_ids(self, analysis: VideoAnalysis, ids: Iterable[int]) -> Tuple[int, int]:
+        """
+        Declare that several IDs are one person: they are all shown as the lowest of
+        them from now on. Only IDs change, never the masked areas.
+        Returns (ID kept, number of frames where two of these IDs are on screen at the
+        same time - above zero, they are probably different people).
+        """
+        ids = set(int(i) for i in ids)
+        known = {t.track_id for t in analysis.tracks}
+        unknown = ids - known
+        if unknown:
+            raise ValueError(f"Unknown IDs: {', '.join(map(str, sorted(unknown)))}")
+        if len(ids) < 2:
+            raise ValueError("At least two IDs are needed to merge")
+        target = min(ids)
+
+        together = 0
+        for fr, boxes in analysis.masks.items():
+            if not (analysis.first_masked <= fr <= analysis.last_masked):
+                continue
+            # Count distinct tracked IDs, so one person merged earlier is not counted twice
+            present = {tid for _, tid, _ in boxes if tid is not None and analysis.id_map.get(tid, tid) in ids}
+            if len(present) > 1:
+                together += 1
+
+        raw_ids = {tid for boxes in analysis.masks.values() for _, tid, _ in boxes if tid is not None}
+        for tid in raw_ids:
+            if analysis.id_map.get(tid, tid) in ids and tid != target:
+                analysis.id_map[tid] = target
+        analysis.id_map.pop(target, None)
+        analysis.tracks = self._summarize_tracks(analysis)
+        return target, together
+
+    def reset_merges(self, analysis: VideoAnalysis) -> None:
+        """Undo every merge_ids: back to the IDs as tracked."""
+        analysis.id_map.clear()
+        analysis.tracks = self._summarize_tracks(analysis)
 
     @staticmethod
     def _boxes_without_ids(
@@ -1070,6 +1119,7 @@ class FaceMasker:
         """
         Second pass: write the masked video from an analysis.
         exclude_ids: IDs whose face is left visible (needs an analysis made with tracking).
+        IDs merged with merge_ids are shown, and excluded, under the ID that was kept.
         """
         an = analysis
         excluded = set(exclude_ids or ())
@@ -1097,6 +1147,8 @@ class FaceMasker:
                         boxes = []
                     elif an.use_tracking:
                         raw = an.masks.get(frame_idx, [])
+                        if an.id_map:
+                            raw = [(b, an.id_map.get(tid, tid), det) for b, tid, det in raw]
                         if excluded:
                             raw = self._boxes_without_ids(raw, excluded)
                         boxes = [(as_render_box(b, frame), track_id, det) for b, track_id, det in raw]

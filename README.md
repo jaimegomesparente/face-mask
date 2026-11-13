@@ -41,6 +41,7 @@ The application opens in your web browser:
 3. Click "Process Video" and download the final MP4.
 4. Optional: the table under the result lists every ID found (thumbnail, first and last appearance).
    Untick the IDs to leave unmasked and click "Process Again": only the rendering is redone, not the detection.
+   If the same person appears under several IDs, select them under the table and merge them.
 
 ---
 
@@ -57,6 +58,7 @@ Options:
 - `--no-tracking`: disable temporal tracking and smoothing (per-frame detection only).
 - `--list-ids`: print the table of IDs found (when each one is on screen).
 - `--exclude-ids`: leave these IDs unmasked, e.g. `--exclude-ids 3,7` (see below).
+- `--merge-ids`: IDs that are the same person, e.g. `--merge-ids 3+7,12+15+20`. Each group is shown under its lowest ID.
 - `--small-faces`: also detect on two overlapping halves of each frame. Catches the tiny faces of crowds and wide shots (under ~10 px), about 3x slower.
 - `--reid`: keep the same ID when a person leaves the frame and comes back (off by default, see below).
 - `--start`, `--end`: only mask faces between these times (seconds, `MM:SS` or `HH:MM:SS`). Either can be omitted. Faces outside this portion stay visible.
@@ -75,7 +77,9 @@ python cli.py my_video.mp4 --exclude-ids 3,7     # second run: IDs 3 and 7 stay 
 ```
 
 - IDs are the same from one run to the next as long as the other options are unchanged.
-- A person whose tracking was interrupted can have several IDs: exclude each of them, or use `--reid` to merge them.
+- A person whose tracking was interrupted can have several IDs: merge them with `--merge-ids 3+7`
+  (or the selector under the table in the web interface), or let `--reid` do it automatically.
+  A warning is shown when merged IDs are on screen at the same time, as they are then probably different people.
 - Not available with `--no-tracking`.
 
 ### Persistent IDs (optional)
