@@ -7,11 +7,13 @@ Minimalist terminalesque UI with authentic camcorder touches:
 - Clean camcorder matte palette & Space Mono typography
 """
 
+import base64
 import os
 import re
 import tempfile
 import time
 import cv2
+import pandas as pd
 import streamlit as st
 from engine import FaceMasker, check_input_container
 
@@ -418,6 +420,7 @@ def get_session_paths(uploaded) -> tuple:
         # New upload: drop the previous temp files before writing the new one
         _remove_quietly(st.session_state.get("input_path"))
         _remove_quietly(st.session_state.get("output_path"))
+        st.session_state.pop("result", None)  # analysis and thumbnails of the previous video
         os.makedirs(TEMP_DIR, exist_ok=True)
         purge_stale_files()
         # Client-controlled name: only reuse the extension if it is a known one
@@ -582,7 +585,8 @@ if uploaded_file is not None:
         )
     )
 
-    if st.button("● Record & Process Video", use_container_width=True):
+    def run_with_progress(work) -> float:
+        """Run work(progress_callback) under a progress bar; returns the elapsed seconds."""
         progress_bar = st.progress(0, text="Initializing...")
         start_time = time.time()
 
@@ -596,34 +600,131 @@ if uploaded_file is not None:
                 text=f"REC {current}/{total} frames ({int(pct * 100)}%) - {fps_proc:.1f} fps - {int(remaining)}s remaining"
             )
 
+        with st.spinner("Processing video frames..."):
+            work(update_progress)
+        progress_bar.progress(1.0, text="Recording complete")
+        return time.time() - start_time
+
+    if st.button("● Record & Process Video", use_container_width=True):
         try:
-            with st.spinner("Processing video frames..."):
-                masker.process_video(
-                    input_path=input_video_path,
-                    output_path=output_video_path,
+            box = {}
+
+            def first_run(update_progress):
+                analysis = masker.analyze_video(
+                    input_video_path,
                     conf_threshold=conf_threshold,
                     reidentify=reidentify,
                     small_faces=small_faces,
                     mask_range=mask_range,
                     progress_callback=update_progress
                 )
-
-            total_duration = time.time() - start_time
-            progress_bar.progress(1.0, text="Recording complete")
-            st.success(f"Video processed in {total_duration:.1f}s ({total_frames / total_duration:.1f} fps)")
-
-            with open(output_video_path, "rb") as vf:
-                video_bytes = vf.read()
-
-                st.video(video_bytes)
-
-                st.download_button(
-                    label="Download Masked Video",
-                    data=video_bytes,
-                    file_name=output_filename,
-                    mime="video/mp4",
-                    use_container_width=True
+                masker.render_video(
+                    analysis,
+                    output_video_path,
+                    progress_callback=update_progress,
+                    progress_offset=analysis.total_frames,
+                    progress_total=analysis.total_frames * 2
                 )
+                box["analysis"] = analysis
+                box["thumbs"] = masker.track_thumbnails(analysis)
 
+            total_duration = run_with_progress(first_run)
+            st.session_state["result"] = {
+                "upload_id": uploaded_file.file_id,
+                "analysis": box["analysis"],
+                "thumbs": box["thumbs"],
+                "excluded": set(),
+                "run": st.session_state.get("result", {}).get("run", 0) + 1,
+                "message": f"Video processed in {total_duration:.1f}s ({total_frames / total_duration:.1f} fps)",
+            }
         except Exception as e:
+            st.session_state.pop("result", None)
             st.error(f"Processing failed: {e}")
+
+    # Kept in the session: the result must survive the reruns triggered by the ID table
+    result = st.session_state.get("result")
+    if result is not None and result["upload_id"] == uploaded_file.file_id:
+        analysis = result["analysis"]
+        st.success(result["message"])
+
+        with open(output_video_path, "rb") as vf:
+            video_bytes = vf.read()
+        st.video(video_bytes)
+        st.download_button(
+            label="Download Masked Video",
+            data=video_bytes,
+            file_name=output_filename,
+            mime="video/mp4",
+            use_container_width=True
+        )
+
+        # Section 03 : Detected IDs
+        st.markdown(
+            f'<div class="section-bar"><span>Detected IDs</span>'
+            f'<span class="section-tc">{len(analysis.tracks)} ID{"s" if len(analysis.tracks) != 1 else ""}</span></div>',
+            unsafe_allow_html=True
+        )
+
+        if not analysis.tracks:
+            st.caption("No face was tracked in this video.")
+        else:
+            def thumb_uri(track_id: int) -> str:
+                img = result["thumbs"].get(track_id)
+                if img is None:
+                    return ""
+                ok, png = cv2.imencode(".png", img)
+                return "data:image/png;base64," + base64.b64encode(png.tobytes()).decode("ascii") if ok else ""
+
+            table = pd.DataFrame([
+                {
+                    "Mask": True,
+                    "ID": t.track_id,
+                    "Face": thumb_uri(t.track_id),
+                    "First seen": format_timecode(t.first_frame, analysis.fps),
+                    "Last seen": format_timecode(t.last_frame, analysis.fps),
+                    "On screen (s)": round(t.n_frames / analysis.fps, 1),
+                }
+                for t in analysis.tracks
+            ])
+            st.caption(
+                "Untick the IDs to leave unmasked, then process again. "
+                "Thumbnails show the unmasked source so people can be told apart; they are not saved."
+            )
+            edited = st.data_editor(
+                table,
+                key=f"id_table_{result['run']}",
+                hide_index=True,
+                use_container_width=True,
+                disabled=["ID", "Face", "First seen", "Last seen", "On screen (s)"],
+                column_config={
+                    "Mask": st.column_config.CheckboxColumn("Mask", help="Untick to leave this face visible"),
+                    "Face": st.column_config.ImageColumn("Face", width="small"),
+                },
+            )
+            wanted_excluded = {int(i) for i in edited.loc[~edited["Mask"].astype(bool), "ID"]}
+            applied = result["excluded"]
+
+            if applied:
+                st.caption("Currently left unmasked: " + ", ".join(f"ID {i}" for i in sorted(applied)))
+
+            n = len(wanted_excluded)
+            label = (
+                f"● Process Again — leave {n} ID{'s' if n != 1 else ''} unmasked" if n
+                else "● Process Again — mask every ID"
+            )
+            if st.button(label, use_container_width=True, disabled=wanted_excluded == applied):
+                try:
+                    rerender_s = run_with_progress(lambda update_progress: masker.render_video(
+                        analysis,
+                        output_video_path,
+                        exclude_ids=wanted_excluded,
+                        progress_callback=update_progress
+                    ))
+                    result["excluded"] = set(wanted_excluded)
+                    result["message"] = (
+                        f"Video processed again in {rerender_s:.1f}s, "
+                        f"{n} ID{'s' if n != 1 else ''} left unmasked"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Processing failed: {e}")
