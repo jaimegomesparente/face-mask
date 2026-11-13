@@ -8,6 +8,7 @@ Minimalist terminalesque UI with authentic camcorder touches:
 """
 
 import base64
+import inspect
 import os
 import re
 import tempfile
@@ -377,6 +378,8 @@ uploaded_file = st.file_uploader(
 # purged after a while: Streamlit has no reliable session-end hook to delete them.
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "face-masker")
 STALE_FILE_AGE_SEC = 6 * 3600
+# Height of the rows of the ID table, so the face thumbnails are large enough to recognize
+THUMB_ROW_HEIGHT = 110
 
 
 def purge_stale_files() -> None:
@@ -690,6 +693,9 @@ if uploaded_file is not None:
                 "Untick the IDs to leave unmasked, then process again. "
                 "Thumbnails show the unmasked source so people can be told apart; they are not saved."
             )
+            editor_options = {}
+            if "row_height" in inspect.signature(st.data_editor).parameters:
+                editor_options["row_height"] = THUMB_ROW_HEIGHT
             edited = st.data_editor(
                 table,
                 key=f"id_table_{result['run']}",
@@ -698,8 +704,9 @@ if uploaded_file is not None:
                 disabled=["ID", "Face", "First seen", "Last seen", "On screen (s)"],
                 column_config={
                     "Mask": st.column_config.CheckboxColumn("Mask", help="Untick to leave this face visible"),
-                    "Face": st.column_config.ImageColumn("Face", width="small"),
+                    "Face": st.column_config.ImageColumn("Face", width="medium"),
                 },
+                **editor_options
             )
             wanted_excluded = {int(i) for i in edited.loc[~edited["Mask"].astype(bool), "ID"]}
             applied = result["excluded"]

@@ -1141,7 +1141,7 @@ class FaceMasker:
 
         return output_path
 
-    def track_thumbnails(self, analysis: VideoAnalysis, size: int = 72) -> Dict[int, np.ndarray]:
+    def track_thumbnails(self, analysis: VideoAnalysis, size: int = 128) -> Dict[int, np.ndarray]:
         """
         One small UNMASKED picture (BGR) of the head behind each ID, so a person can be
         told from another when choosing which IDs to leave visible. Kept in memory only.
