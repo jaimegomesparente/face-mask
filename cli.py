@@ -11,6 +11,20 @@ from tqdm import tqdm
 from engine import FaceMasker
 
 
+def parse_time(value: str) -> float:
+    """Seconds ("83.5") or timecode ("1:23.5", "0:01:23") -> seconds."""
+    try:
+        parts = [float(p) for p in value.split(":")]
+    except ValueError:
+        parts = []
+    if not 1 <= len(parts) <= 3 or any(p < 0 for p in parts):
+        raise argparse.ArgumentTypeError(f"invalid time '{value}' (use seconds, MM:SS or HH:MM:SS)")
+    seconds = 0.0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Face Masker - Face anonymization for video."
@@ -19,7 +33,18 @@ def parse_args():
     parser.add_argument("-o", "--output", default=None, help="Path to output video file (default: <name>_masked.mp4)")
     parser.add_argument("--conf", type=float, default=FaceMasker.DEFAULT_CONF_THRESHOLD, help="Detection confidence threshold")
     parser.add_argument("--no-tracking", action="store_true", help="Disable temporal box smoothing")
-    return parser.parse_args()
+    parser.add_argument(
+        "--start", type=parse_time, default=None, metavar="TIME",
+        help="Only mask faces from this time on (seconds, MM:SS or HH:MM:SS; default: beginning)"
+    )
+    parser.add_argument(
+        "--end", type=parse_time, default=None, metavar="TIME",
+        help="Only mask faces up to this time (seconds, MM:SS or HH:MM:SS; default: end of video)"
+    )
+    args = parser.parse_args()
+    if args.start is not None and args.end is not None and args.end <= args.start:
+        parser.error("--end must be after --start")
+    return args
 
 
 def main():
@@ -36,6 +61,12 @@ def main():
     print(f"Input file    : {args.input}")
     print(f"Output file   : {output_path}")
     print(f"Stabilization : {'Disabled' if args.no_tracking else 'Enabled'}")
+    mask_range = None
+    if args.start is not None or args.end is not None:
+        mask_range = (args.start, args.end)
+        start_txt = f"{args.start:g}s" if args.start is not None else "beginning"
+        end_txt = f"{args.end:g}s" if args.end is not None else "end"
+        print(f"Masked portion: {start_txt} -> {end_txt} (faces stay visible elsewhere)")
     print("=" * 60)
 
     masker = FaceMasker()
@@ -54,6 +85,7 @@ def main():
             output_path=output_path,
             conf_threshold=args.conf,
             use_tracking=not args.no_tracking,
+            mask_range=mask_range,
             progress_callback=on_progress
         )
         if pbar:

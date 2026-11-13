@@ -603,13 +603,27 @@ class FaceMasker:
         input_path: str,
         conf_threshold: float,
         progress_callback: Optional[Callable[[int, int], None]],
-        total_frames: int
+        total_frames: int,
+        frame_range: Optional[Tuple[int, float]] = None
     ) -> List[List[Detection]]:
         cap = cv2.VideoCapture(input_path)
         per_frame: List[List[Detection]] = []
         scan_conf = min(0.20, conf_threshold)
         try:
             while True:
+                if frame_range is not None and len(per_frame) > frame_range[1]:
+                    # Past the portion to mask: nothing left to detect
+                    if progress_callback and total_frames > 0:
+                        progress_callback(total_frames, total_frames * 2)
+                    break
+                if frame_range is not None and len(per_frame) < frame_range[0]:
+                    # Before the portion to mask: skip decoding and detection
+                    if not cap.grab():
+                        break
+                    per_frame.append([])
+                    if progress_callback and total_frames > 0:
+                        progress_callback(min(len(per_frame), total_frames), total_frames * 2)
+                    continue
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -631,8 +645,18 @@ class FaceMasker:
         conf_threshold: float = DEFAULT_CONF_THRESHOLD,
         use_tracking: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
-        debug: bool = False
+        debug: bool = False,
+        mask_range: Optional[Tuple[Optional[float], Optional[float]]] = None
     ) -> str:
+        """
+        mask_range: (start, end) in seconds, either bound may be None. Faces are only
+        masked inside this portion; the rest of the video is copied with faces visible.
+        """
+        range_start, range_end = mask_range if mask_range is not None else (None, None)
+        range_start = 0.0 if range_start is None else float(range_start)
+        range_end = math.inf if range_end is None else float(range_end)
+        if range_start < 0 or range_end <= range_start:
+            raise ValueError(f"Invalid portion to mask: start={range_start}s, end={range_end}s")
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Input video not found: {input_path}")
         check_input_container(input_path)
@@ -649,10 +673,22 @@ class FaceMasker:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
 
+        # Frames to mask (inclusive), rounded outwards: one masked frame too many is
+        # harmless, a visible face inside the requested portion is not.
+        first_masked = int(math.floor(range_start * fps))
+        last_masked = math.inf if math.isinf(range_end) else int(math.ceil(range_end * fps))
+        partial = mask_range is not None and (first_masked > 0 or not math.isinf(last_masked))
+
         # ---- Pass 1: Detection & Multi-Object Tracking ----
         masks: Dict[int, List[Tuple[FBox, int, bool]]] = {}
         if use_tracking:
-            per_frame = self._scan_video(input_path, conf_threshold, progress_callback, total_frames)
+            # Scan a little beyond the portion so tracks at its edges are as solid as
+            # in a full scan; rendering is clipped to the exact portion below.
+            margin = PersistentTracker().max_gap
+            scan_range = (first_masked - margin, last_masked + margin) if partial else None
+            per_frame = self._scan_video(
+                input_path, conf_threshold, progress_callback, total_frames, scan_range
+            )
             masks = PersistentTracker().build(per_frame, frame_size=(width, height), conf_threshold=conf_threshold)
 
         # ---- Pass 2: Rendering & Export ----
@@ -668,7 +704,9 @@ class FaceMasker:
                     if not ret:
                         break
 
-                    if use_tracking:
+                    if not (first_masked <= frame_idx <= last_masked):
+                        boxes = []
+                    elif use_tracking:
                         raw_tracks = masks.get(frame_idx, [])
                         boxes = [
                             (

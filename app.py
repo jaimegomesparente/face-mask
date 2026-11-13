@@ -538,6 +538,30 @@ if uploaded_file is not None:
     # Download name only: uploaded_file.name is client-controlled, never use it in a path
     output_filename = f"masked_{safe_stem(uploaded_file.name)}.mp4"
 
+    mask_range = None
+    if duration_sec > 0.2 and st.checkbox(
+        "Mask only a portion of the video",
+        value=False,
+        help="Faces outside the selected portion stay visible in the exported video."
+    ):
+        range_max = round(duration_sec + 0.05, 1)
+        range_start, range_end = st.slider(
+            "Portion to mask (seconds)",
+            min_value=0.0,
+            max_value=range_max,
+            value=(0.0, range_max),
+            step=0.1
+        )
+        if range_end <= range_start:
+            st.warning("Select a portion with a non-zero duration.")
+            st.stop()
+        mask_range = (range_start, None if range_end >= range_max else range_end)
+        st.caption(
+            f"Masking from TC {format_timecode(int(range_start * fps), fps)} "
+            f"to TC {format_timecode(min(total_frames, int(range_end * fps)), fps)} — "
+            "faces stay visible elsewhere."
+        )
+
     if st.button("● Record & Process Video", use_container_width=True):
         progress_bar = st.progress(0, text="Initializing...")
         start_time = time.time()
@@ -558,6 +582,7 @@ if uploaded_file is not None:
                     input_path=input_video_path,
                     output_path=output_video_path,
                     conf_threshold=conf_threshold,
+                    mask_range=mask_range,
                     progress_callback=update_progress
                 )
 

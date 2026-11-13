@@ -53,6 +53,11 @@ Options:
 - `-o, --output`: output path (default: `<name>_masked.mp4`).
 - `--conf`: detection confidence threshold (default: 0.30).
 - `--no-tracking`: disable temporal tracking and smoothing (per-frame detection only).
+- `--start`, `--end`: only mask faces between these times (seconds, `MM:SS` or `HH:MM:SS`). Either can be omitted. Faces outside this portion stay visible.
+
+```powershell
+python cli.py my_video.mp4 --start 0:12 --end 0:45.5
+```
 
 ---
 
