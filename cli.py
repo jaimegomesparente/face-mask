@@ -34,6 +34,10 @@ def parse_args():
     parser.add_argument("--conf", type=float, default=FaceMasker.DEFAULT_CONF_THRESHOLD, help="Detection confidence threshold")
     parser.add_argument("--no-tracking", action="store_true", help="Disable temporal box smoothing")
     parser.add_argument(
+        "--reid", action="store_true",
+        help="Keep the same ID when a person leaves the frame and comes back (slower, in-memory face comparison)"
+    )
+    parser.add_argument(
         "--start", type=parse_time, default=None, metavar="TIME",
         help="Only mask faces from this time on (seconds, MM:SS or HH:MM:SS; default: beginning)"
     )
@@ -44,6 +48,8 @@ def parse_args():
     args = parser.parse_args()
     if args.start is not None and args.end is not None and args.end <= args.start:
         parser.error("--end must be after --start")
+    if args.reid and args.no_tracking:
+        parser.error("--reid needs tracking: it cannot be combined with --no-tracking")
     return args
 
 
@@ -61,6 +67,7 @@ def main():
     print(f"Input file    : {args.input}")
     print(f"Output file   : {output_path}")
     print(f"Stabilization : {'Disabled' if args.no_tracking else 'Enabled'}")
+    print(f"Persistent IDs: {'Enabled' if args.reid else 'Disabled'}")
     mask_range = None
     if args.start is not None or args.end is not None:
         mask_range = (args.start, args.end)
@@ -85,6 +92,7 @@ def main():
             output_path=output_path,
             conf_threshold=args.conf,
             use_tracking=not args.no_tracking,
+            reidentify=args.reid,
             mask_range=mask_range,
             progress_callback=on_progress
         )

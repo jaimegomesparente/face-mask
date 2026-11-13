@@ -57,6 +57,85 @@ class Detection:
     bbox: FBox                    # x, y, w, h
     score: float
     reject: Optional[str] = None  # None if accepted
+    emb: Optional[np.ndarray] = None  # L2-normalized appearance vector (re-identification only)
+
+
+class FaceEmbedder:
+    """
+    Appearance descriptor used to recognize a person who left the frame and came back.
+    YuNet locates the 5 landmarks on a crop around the detected box (the YOLO model only
+    outputs boxes), SFace turns the aligned face into a 128-d vector.
+    Vectors only ever live in memory, for the duration of one video.
+    """
+
+    MODEL_NAME = "face_recognition_sface_2021dec.onnx"
+    LANDMARK_MODEL_NAME = "face_detection_yunet_2023mar.onnx"
+    MODEL_URL = (
+        "https://github.com/opencv/opencv_zoo/raw/main/models/"
+        "face_recognition_sface/face_recognition_sface_2021dec.onnx"
+    )
+    CROP_SIZE = 160        # YuNet input side
+    CROP_MARGIN = 1.6      # crop side, relative to the longest side of the detected box
+    MIN_FACE_SIZE = 24.0   # below this, different people get near-identical vectors
+    SHARP_FACE_SIZE = 40.0 # from this size on, vectors are reliable enough for the normal threshold
+    MIN_SCORE = 0.50       # low-confidence detections (profiles, blur) are skipped
+
+    def __init__(self, model_path: str, landmark_model_path: str):
+        for p in (model_path, landmark_model_path):
+            if not os.path.exists(p):
+                raise FileNotFoundError(
+                    f"Re-identification model not found: {p}\n"
+                    f"Download {self.MODEL_NAME} from {self.MODEL_URL}"
+                )
+        self._recognizer = cv2.FaceRecognizerSF.create(model_path, "")
+        self._landmarks = cv2.FaceDetectorYN.create(
+            model=landmark_model_path,
+            config="",
+            input_size=(self.CROP_SIZE, self.CROP_SIZE),
+            score_threshold=0.60,
+            nms_threshold=0.30,
+            top_k=50,
+        )
+
+    def embed(self, frame: np.ndarray, det: Detection) -> Optional[np.ndarray]:
+        x, y, w, h = det.bbox
+        if det.score < self.MIN_SCORE or min(w, h) < self.MIN_FACE_SIZE:
+            return None
+
+        # Square crop centered on the face, zero-padded where it crosses the frame border
+        fh, fw = frame.shape[:2]
+        side = max(8, int(round(max(w, h) * self.CROP_MARGIN)))
+        x0 = int(round(x + w / 2 - side / 2))
+        y0 = int(round(y + h / 2 - side / 2))
+        sx1, sy1 = max(0, x0), max(0, y0)
+        sx2, sy2 = min(fw, x0 + side), min(fh, y0 + side)
+        if sx2 <= sx1 or sy2 <= sy1:
+            return None
+        crop = np.zeros((side, side, 3), dtype=frame.dtype)
+        crop[sy1 - y0:sy2 - y0, sx1 - x0:sx2 - x0] = frame[sy1:sy2, sx1:sx2]
+
+        scale = self.CROP_SIZE / side
+        small = cv2.resize(crop, (self.CROP_SIZE, self.CROP_SIZE), interpolation=cv2.INTER_AREA)
+        _, faces = self._landmarks.detect(small)
+        if faces is None or len(faces) == 0:
+            return None
+
+        # Keep the face sitting at the crop center (a neighbour may be partly in the crop)
+        c = self.CROP_SIZE / 2.0
+        best = min(faces, key=lambda f: math.hypot(f[0] + f[2] / 2 - c, f[1] + f[3] / 2 - c))
+        if math.hypot(best[0] + best[2] / 2 - c, best[1] + best[3] / 2 - c) > 0.25 * self.CROP_SIZE:
+            return None
+
+        # Back to full-frame coordinates: x,y,w,h then 5 landmarks (x,y), then score
+        row = np.array(best, dtype=np.float32).reshape(1, -1)
+        row[0, :14] /= scale
+        row[0, [0, 4, 6, 8, 10, 12]] += x0
+        row[0, [1, 5, 7, 9, 11, 13]] += y0
+
+        aligned = self._recognizer.alignCrop(frame, row)
+        feat = np.asarray(self._recognizer.feature(aligned), dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(feat))
+        return feat / norm if norm > 0 else None
 
 
 class YOLOv8FaceDetector:
@@ -166,7 +245,23 @@ class PersistentTracker:
         lead_frames: int = 3,
         max_interp_gap: int = 15,
         min_ref_size: float = 40.0,
+        reid_sim: float = 0.40,
+        reid_sim_small: float = 0.55,
+        reid_min_samples: int = 2,
+        stitch_gap: int = 30,
+        stitch_dist: float = 0.40,
     ):
+        # Continuity: longest loss (frames) bridged, and how far (in face sizes) the
+        # person may reappear from where they were heading
+        self.stitch_gap = stitch_gap
+        self.stitch_dist = stitch_dist
+        # Cosine similarity above which two tracks are the same person (SFace's own
+        # same-identity threshold is 0.363; stricter here, a wrong merge is worse than a new ID)
+        self.reid_sim = reid_sim
+        # Small faces (below FaceEmbedder.SHARP_FACE_SIZE) are blurry and look alike:
+        # measured on crowd footage, different people reach 0.45 there, so ask for more.
+        self.reid_sim_small = reid_sim_small
+        self.reid_min_samples = reid_min_samples
         self.max_gap = max_gap
         self.max_dist = max_dist
         self.max_size_ratio = max_size_ratio
@@ -224,6 +319,9 @@ class PersistentTracker:
                 t['obs'][f] = (d.bbox, d.score)
                 t['bbox'] = d.bbox
                 t['last'] = f
+                if d.emb is not None:
+                    t['embs'].append(d.emb)
+                    t['emb_sizes'].append(min(d.bbox[2], d.bbox[3]))
 
             for di, d in enumerate(cands):
                 if di in used_d:
@@ -235,7 +333,9 @@ class PersistentTracker:
                     'id': next_track_id,
                     'obs': {f: (d.bbox, d.score)},
                     'bbox': d.bbox,
-                    'last': f
+                    'last': f,
+                    'embs': [d.emb] if d.emb is not None else [],
+                    'emb_sizes': [min(d.bbox[2], d.bbox[3])] if d.emb is not None else []
                 }
                 next_track_id += 1
                 tracklets.append(t)
@@ -264,6 +364,116 @@ class PersistentTracker:
 
         mean = sum(scores) / n
         return mx >= self.high_conf or (n >= 4 and mean >= self.profile_conf)
+
+    def _continuity_links(self, tracks: List[dict]) -> List[Tuple[dict, dict]]:
+        """
+        Pairs (earlier track, later track) that are one person briefly lost (hidden
+        behind someone, head turned): the later track starts where the earlier one
+        was heading, shortly after it ended. Works whatever the face size, unlike
+        appearance, but only over short gaps. Ambiguous cases are left alone.
+        """
+        def center(bx: FBox) -> Tuple[float, float]:
+            return bx[0] + bx[2] / 2, bx[1] + bx[3] / 2
+
+        cands = []
+        for a in tracks:
+            if len(a['obs']) < 5:
+                continue
+            frames = sorted(a['obs'])[-12:]
+            last = frames[-1]
+            (x0, y0), (x1, y1) = center(a['obs'][frames[0]][0]), center(a['obs'][last][0])
+            span = max(1, last - frames[0])
+            vx, vy = ((x1 - x0) / span, (y1 - y0) / span) if len(frames) >= 4 else (0.0, 0.0)
+            la = a['obs'][last][0]
+            size_a = math.sqrt(max(la[2] * la[3], 1e-6))
+            for b in tracks:
+                first = min(b['obs'])
+                gap = first - last
+                if b is a or not (1 <= gap <= self.stitch_gap):
+                    continue
+                fb = b['obs'][first][0]
+                size_b = math.sqrt(max(fb[2] * fb[3], 1e-6))
+                if max(size_a, size_b) / min(size_a, size_b) > 1.5:
+                    continue
+                bx, by = center(fb)
+                d = math.hypot(x1 + vx * gap - bx, y1 + vy * gap - by) / max(size_a, size_b, 16.0)
+                if d <= self.stitch_dist * 2 + 0.3:
+                    cands.append((d, id(a), id(b), a, b))
+        cands.sort(key=lambda c: c[:3])
+
+        links: List[Tuple[dict, dict]] = []
+        used_a, used_b = set(), set()
+        for d, ia, ib, a, b in cands:
+            if d > self.stitch_dist or ia in used_a or ib in used_b:
+                continue
+            # Another plausible partner for either side: cannot tell who is who
+            if any((c[1] == ia) != (c[2] == ib) and c[0] < d * 2 + 0.3 for c in cands):
+                continue
+            # Both faces readable and clearly different: not the same person
+            if len(a['embs']) >= self.reid_min_samples and len(b['embs']) >= self.reid_min_samples:
+                ma, mb = np.mean(a['embs'], axis=0), np.mean(b['embs'], axis=0)
+                sim = float(np.dot(ma, mb) / max(float(np.linalg.norm(ma) * np.linalg.norm(mb)), 1e-9))
+                if sim < 0.20:
+                    continue
+            used_a.add(ia)
+            used_b.add(ib)
+            links.append((a, b))
+        return links
+
+    def _merge_identities(self, tracks: List[dict]) -> None:
+        """
+        Give the same ID to tracks showing the same person, using two cues:
+        position continuity over short losses, then face appearance for someone who
+        left the frame and came back. Only IDs are rewritten: tracks stay separate, so
+        the masked areas are strictly unchanged and nothing is interpolated across the absence.
+        """
+        # 1. Continuity: chain tracks into groups
+        group_of = {id(t): [t] for t in tracks}
+        for a, b in self._continuity_links(tracks):
+            ga, gb = group_of[id(a)], group_of[id(b)]
+            if ga is not gb:
+                ga.extend(gb)
+                for t in gb:
+                    group_of[id(t)] = ga
+        groups = list({id(g): g for g in group_of.values()}.values())
+        groups.sort(key=lambda g: min(min(t['obs']) for t in g))
+
+        # 2. Appearance: match groups to identities seen earlier
+        identities: List[dict] = []
+        for g in groups:
+            g.sort(key=lambda t: min(t['obs']))
+            spans = [(min(t['obs']), max(t['obs'])) for t in g]
+            embs = [e for t in g for e in t['embs']]
+            sizes = [z for t in g for z in t['emb_sizes']]
+
+            best = None
+            if len(embs) >= self.reid_min_samples:
+                mean = np.mean(embs, axis=0)
+                mean /= max(float(np.linalg.norm(mean)), 1e-9)
+                sharp = float(np.median(sizes)) >= FaceEmbedder.SHARP_FACE_SIZE
+                best_margin = 0.0
+                for ident in identities:
+                    # One person cannot be at two places at once
+                    if any(f <= b and a <= l for a, b in ident['spans'] for f, l in spans):
+                        continue
+                    ref = ident['sum'] / max(float(np.linalg.norm(ident['sum'])), 1e-9)
+                    limit = self.reid_sim if (sharp and ident['sharp']) else self.reid_sim_small
+                    margin = float(np.dot(mean, ref)) - limit
+                    if margin >= best_margin:
+                        best, best_margin = ident, margin
+
+                if best is None:
+                    identities.append({
+                        'id': g[0]['id'], 'sum': mean * len(embs), 'spans': list(spans), 'sharp': sharp
+                    })
+                else:
+                    best['sum'] = best['sum'] + mean * len(embs)
+                    best['spans'].extend(spans)
+                    best['sharp'] = best['sharp'] and sharp
+
+            new_id = best['id'] if best is not None else g[0]['id']
+            for t in g:
+                t['id'] = new_id
 
     def _expand_track(self, t: dict, n_frames: int, frame_size: Tuple[int, int] = (0, 0)) -> List[Tuple[int, FBox, int, bool]]:
         frames = sorted(t['obs'])
@@ -336,13 +546,15 @@ class PersistentTracker:
         self,
         per_frame: List[List[Detection]],
         frame_size: Tuple[int, int] = (0, 0),
-        conf_threshold: Optional[float] = None
+        conf_threshold: Optional[float] = None,
+        merge_ids: bool = False
     ) -> Dict[int, List[Tuple[FBox, Optional[int], bool]]]:
         n = len(per_frame)
         out: Dict[int, List[Tuple[FBox, Optional[int], bool]]] = {}
-        for t in self._link(per_frame):
-            if not self._keep(t, conf_threshold):
-                continue
+        kept = [t for t in self._link(per_frame) if self._keep(t, conf_threshold)]
+        if merge_ids:
+            self._merge_identities(kept)
+        for t in kept:
             for fr, bbox, track_id, det in self._expand_track(t, n, frame_size):
                 out.setdefault(fr, []).append((bbox, track_id, det))
 
@@ -367,6 +579,27 @@ class FaceMasker:
     DEFAULT_BOX_COLOR = (60, 255, 0)
     DEFAULT_BOX_THICKNESS = 1
     DEFAULT_CONF_THRESHOLD = 0.30
+    # Re-identification: appearance vectors are computed on one frame out of N
+    REID_STRIDE = 3
+
+    @staticmethod
+    def _reid_model_paths() -> Tuple[str, str]:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return (
+            os.path.join(base_dir, FaceEmbedder.MODEL_NAME),
+            os.path.join(base_dir, FaceEmbedder.LANDMARK_MODEL_NAME),
+        )
+
+    @classmethod
+    def reid_available(cls) -> bool:
+        return all(os.path.exists(p) for p in cls._reid_model_paths())
+
+    def _get_embedder(self) -> FaceEmbedder:
+        with self._lock:
+            if self._embedder is None:
+                self._embedder = FaceEmbedder(*self._reid_model_paths())
+            return self._embedder
+
     def __init__(self, model_path: Optional[str] = None):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         if model_path is None:
@@ -382,6 +615,7 @@ class FaceMasker:
         # cv2.dnn networks / FaceDetectorYN are not thread-safe (setInput + forward).
         # Streamlit shares this instance across sessions, each running in its own thread.
         self._lock = threading.Lock()
+        self._embedder: Optional[FaceEmbedder] = None  # loaded on first re-identification
         if self.is_yolo:
             self._detector = YOLOv8FaceDetector(model_path, conf_thresh=self.DEFAULT_CONF_THRESHOLD)
         else:
@@ -604,6 +838,7 @@ class FaceMasker:
         conf_threshold: float,
         progress_callback: Optional[Callable[[int, int], None]],
         total_frames: int,
+        embedder: Optional[FaceEmbedder] = None,
         frame_range: Optional[Tuple[int, float]] = None
     ) -> List[List[Detection]]:
         cap = cv2.VideoCapture(input_path)
@@ -627,7 +862,13 @@ class FaceMasker:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                per_frame.append(self.detect_faces(frame, conf_threshold=scan_conf))
+                dets = self.detect_faces(frame, conf_threshold=scan_conf)
+                if embedder is not None and len(per_frame) % self.REID_STRIDE == 0:
+                    with self._lock:
+                        for d in dets:
+                            if d.reject is None:
+                                d.emb = embedder.embed(frame, d)
+                per_frame.append(dets)
                 if progress_callback and total_frames > 0:
                     progress_callback(min(len(per_frame), total_frames), total_frames * 2)
         finally:
@@ -646,9 +887,12 @@ class FaceMasker:
         use_tracking: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         debug: bool = False,
+        reidentify: bool = False,
         mask_range: Optional[Tuple[Optional[float], Optional[float]]] = None
     ) -> str:
         """
+        reidentify: keep the same ID for a person who leaves the frame and comes back
+        (needs use_tracking). Only changes the ID badges, never the masked areas.
         mask_range: (start, end) in seconds, either bound may be None. Faces are only
         masked inside this portion; the rest of the video is copied with faces visible.
         """
@@ -660,6 +904,8 @@ class FaceMasker:
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Input video not found: {input_path}")
         check_input_container(input_path)
+        # Fail before the scan, not after it, if the model is missing
+        embedder = self._get_embedder() if (reidentify and use_tracking) else None
 
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
@@ -687,9 +933,12 @@ class FaceMasker:
             margin = PersistentTracker().max_gap
             scan_range = (first_masked - margin, last_masked + margin) if partial else None
             per_frame = self._scan_video(
-                input_path, conf_threshold, progress_callback, total_frames, scan_range
+                input_path, conf_threshold, progress_callback, total_frames, embedder, scan_range
             )
-            masks = PersistentTracker().build(per_frame, frame_size=(width, height), conf_threshold=conf_threshold)
+            masks = PersistentTracker().build(
+                per_frame, frame_size=(width, height), conf_threshold=conf_threshold,
+                merge_ids=embedder is not None
+            )
 
         # ---- Pass 2: Rendering & Export ----
         offset = total_frames if use_tracking else 0

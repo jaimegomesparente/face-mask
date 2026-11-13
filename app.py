@@ -562,6 +562,19 @@ if uploaded_file is not None:
             "faces stay visible elsewhere."
         )
 
+    reid_ok = FaceMasker.reid_available()
+    reidentify = st.checkbox(
+        "Keep the same ID when a person re-enters the frame",
+        value=False,
+        disabled=not reid_ok,
+        help=(
+            "Compares faces within this video to recognize someone who left the frame and came back. "
+            "Slower. Face signatures stay in memory and are discarded after processing."
+            if reid_ok else
+            "Recognition model missing: see the README to download face_recognition_sface_2021dec.onnx."
+        )
+    )
+
     if st.button("● Record & Process Video", use_container_width=True):
         progress_bar = st.progress(0, text="Initializing...")
         start_time = time.time()
@@ -582,6 +595,7 @@ if uploaded_file is not None:
                     input_path=input_video_path,
                     output_path=output_video_path,
                     conf_threshold=conf_threshold,
+                    reidentify=reidentify,
                     mask_range=mask_range,
                     progress_callback=update_progress
                 )
