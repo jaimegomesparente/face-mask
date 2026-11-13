@@ -636,8 +636,10 @@ if uploaded_file is not None:
                 "upload_id": uploaded_file.file_id,
                 "analysis": box["analysis"],
                 "thumbs": box["thumbs"],
-                "excluded": set(),
-                "run": st.session_state.get("result", {}).get("run", 0) + 1,
+                "excluded": set(),      # IDs left unmasked in the video currently shown
+                "merges": {},           # merges applied to the video currently shown
+                "unticked": set(),      # IDs unticked when the table was last rebuilt
+                "table": st.session_state.get("result", {}).get("table", 0) + 1,
                 "message": f"Video processed in {total_duration:.1f}s ({total_frames / total_duration:.1f} fps)",
             }
         except Exception as e:
@@ -680,7 +682,7 @@ if uploaded_file is not None:
 
             table = pd.DataFrame([
                 {
-                    "Mask": True,
+                    "Mask": t.track_id not in result["unticked"],
                     "ID": t.track_id,
                     "Face": thumb_uri(t.track_id),
                     "First seen": format_timecode(t.first_frame, analysis.fps),
@@ -698,7 +700,7 @@ if uploaded_file is not None:
                 editor_options["row_height"] = THUMB_ROW_HEIGHT
             edited = st.data_editor(
                 table,
-                key=f"id_table_{result['run']}",
+                key=f"id_table_{result['table']}",
                 hide_index=True,
                 use_container_width=True,
                 disabled=["ID", "Face", "First seen", "Last seen", "On screen (s)"],
@@ -709,17 +711,64 @@ if uploaded_file is not None:
                 **editor_options
             )
             wanted_excluded = {int(i) for i in edited.loc[~edited["Mask"].astype(bool), "ID"]}
-            applied = result["excluded"]
 
-            if applied:
-                st.caption("Currently left unmasked: " + ", ".join(f"ID {i}" for i in sorted(applied)))
+            # Merging: the same person tracked under several IDs
+            all_ids = [t.track_id for t in analysis.tracks]
+            to_merge = st.multiselect(
+                "Same person under several IDs? Select them to merge",
+                options=all_ids,
+                format_func=lambda i: f"ID {i}",
+                key=f"merge_select_{result['table']}",
+                help="The selected IDs become a single one (the lowest). The video is updated at the next processing."
+            )
+            col_merge, col_undo = st.columns(2)
+            with col_merge:
+                do_merge = st.button(
+                    f"Merge {len(to_merge)} IDs" if len(to_merge) >= 2 else "Merge IDs",
+                    use_container_width=True,
+                    disabled=len(to_merge) < 2
+                )
+            with col_undo:
+                do_undo = st.button("Undo all merges", use_container_width=True, disabled=not analysis.id_map)
+
+            if do_merge:
+                kept, together = masker.merge_ids(analysis, to_merge)
+                # The merged ID stays masked unless every merged ID had been unticked
+                merged = set(to_merge)
+                unticked = wanted_excluded - merged
+                if merged <= wanted_excluded:
+                    unticked.add(kept)
+                result["unticked"] = unticked
+                result["table"] += 1  # rows changed: rebuild the table and the selector
+                result["notice"] = (
+                    f"IDs {', '.join(map(str, sorted(merged)))} merged into ID {kept}."
+                    + (
+                        f" Warning: they are on screen together on {together} frame"
+                        f"{'s' if together != 1 else ''}, so they may be different people."
+                        if together else ""
+                    )
+                )
+                st.rerun()
+            if do_undo:
+                masker.reset_merges(analysis)
+                result["unticked"] = {i for i in wanted_excluded if i in {t.track_id for t in analysis.tracks}}
+                result["table"] += 1
+                result["notice"] = "Merges undone."
+                st.rerun()
+
+            if result.get("notice"):
+                (st.warning if "Warning" in result["notice"] else st.info)(result["notice"])
+
+            if result["excluded"]:
+                st.caption("Currently left unmasked: " + ", ".join(f"ID {i}" for i in sorted(result["excluded"])))
 
             n = len(wanted_excluded)
             label = (
                 f"● Process Again — leave {n} ID{'s' if n != 1 else ''} unmasked" if n
                 else "● Process Again — mask every ID"
             )
-            if st.button(label, use_container_width=True, disabled=wanted_excluded == applied):
+            up_to_date = wanted_excluded == result["excluded"] and analysis.id_map == result["merges"]
+            if st.button(label, use_container_width=True, disabled=up_to_date):
                 try:
                     rerender_s = run_with_progress(lambda update_progress: masker.render_video(
                         analysis,
@@ -728,6 +777,8 @@ if uploaded_file is not None:
                         progress_callback=update_progress
                     ))
                     result["excluded"] = set(wanted_excluded)
+                    result["merges"] = dict(analysis.id_map)
+                    result["notice"] = None
                     result["message"] = (
                         f"Video processed again in {rerender_s:.1f}s, "
                         f"{n} ID{'s' if n != 1 else ''} left unmasked"
