@@ -11,12 +11,13 @@ import base64
 import inspect
 import os
 import re
+import sys
 import tempfile
 import time
 import cv2
 import pandas as pd
 import streamlit as st
-from engine import FaceMasker, check_input_container
+from engine import FaceMasker, VideoAnalysis, check_input_container
 
 
 # Page configuration
@@ -342,11 +343,19 @@ def format_timecode(frame_num: int, frame_rate: float) -> str:
 
 
 @st.cache_resource
-def load_masker():
+def load_masker(engine_version: float):
     return FaceMasker()
 
 
-masker = load_masker()
+def engine_version() -> float:
+    """Changes whenever engine.py does, so an edited engine is never served from the cache."""
+    try:
+        return os.path.getmtime(sys.modules[FaceMasker.__module__].__file__)
+    except (OSError, KeyError, AttributeError, TypeError):
+        return 0.0
+
+
+masker = load_masker(engine_version())
 
 # Petite barre camcorder épurée
 st.markdown("""
@@ -380,6 +389,8 @@ TEMP_DIR = os.path.join(tempfile.gettempdir(), "face-masker")
 STALE_FILE_AGE_SEC = 6 * 3600
 # Height of the rows of the ID table, so the face thumbnails are large enough to recognize
 THUMB_ROW_HEIGHT = 110
+# Fields of the processing result kept in the session
+RESULT_KEYS = {"upload_id", "analysis", "thumbs", "excluded", "merges", "unticked", "table", "message"}
 
 
 def purge_stale_files() -> None:
@@ -648,6 +659,13 @@ if uploaded_file is not None:
 
     # Kept in the session: the result must survive the reruns triggered by the ID table
     result = st.session_state.get("result")
+    if result is not None and not (
+        RESULT_KEYS <= result.keys() and isinstance(result["analysis"], VideoAnalysis)
+    ):
+        # Result left in the session by an older version of the app: process again
+        st.session_state.pop("result", None)
+        result = None
+        st.info("The app was updated: process the video again to see the result.")
     if result is not None and result["upload_id"] == uploaded_file.file_id:
         analysis = result["analysis"]
         st.success(result["message"])
