@@ -367,7 +367,6 @@ class FaceMasker:
     DEFAULT_BOX_COLOR = (60, 255, 0)
     DEFAULT_BOX_THICKNESS = 1
     DEFAULT_CONF_THRESHOLD = 0.30
-
     def __init__(self, model_path: Optional[str] = None):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         if model_path is None:
@@ -657,63 +656,70 @@ class FaceMasker:
             masks = PersistentTracker().build(per_frame, frame_size=(width, height), conf_threshold=conf_threshold)
 
         # ---- Pass 2: Rendering & Export ----
-        # Unique, unpredictable, atomically created temp file (only readable by the user on POSIX)
-        temp_fd, temp_video_path = tempfile.mkstemp(prefix="facemask_render_", suffix=".mp4")
-        os.close(temp_fd)
-
-        cap = cv2.VideoCapture(input_path)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
-
         offset = total_frames if use_tracking else 0
         denom = total_frames * 2 if use_tracking else total_frames
 
-        frame_idx = 0
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+        def render_all(write: Callable[[np.ndarray], None]) -> None:
+            cap = cv2.VideoCapture(input_path)
+            frame_idx = 0
+            try:
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
 
-                if use_tracking:
-                    raw_tracks = masks.get(frame_idx, [])
-                    boxes = [
-                        (
+                    if use_tracking:
+                        raw_tracks = masks.get(frame_idx, [])
+                        boxes = [
                             (
-                                (int(round(b[0])), int(round(b[1])), int(round(b[2])), int(round(b[3]))),
-                                self.expand_bbox_for_head(b, frame.shape, padding_ratio)
-                            ),
-                            track_id,
-                            det
-                        )
-                        for b, track_id, det in raw_tracks
-                    ]
-                else:
-                    dets = self.detect_faces(frame, conf_threshold=conf_threshold)
-                    boxes = [
-                        (
+                                (
+                                    (int(round(b[0])), int(round(b[1])), int(round(b[2])), int(round(b[3]))),
+                                    self.expand_bbox_for_head(b, frame.shape, padding_ratio)
+                                ),
+                                track_id,
+                                det
+                            )
+                            for b, track_id, det in raw_tracks
+                        ]
+                    else:
+                        dets = self.detect_faces(frame, conf_threshold=conf_threshold)
+                        boxes = [
                             (
-                                (int(round(d.bbox[0])), int(round(d.bbox[1])), int(round(d.bbox[2])), int(round(d.bbox[3]))),
-                                self.expand_bbox_for_head(d.bbox, frame.shape, padding_ratio)
-                            ),
-                            i + 1,
-                            True
-                        )
-                        for i, d in enumerate(dets)
-                    ]
+                                (
+                                    (int(round(d.bbox[0])), int(round(d.bbox[1])), int(round(d.bbox[2])), int(round(d.bbox[3]))),
+                                    self.expand_bbox_for_head(d.bbox, frame.shape, padding_ratio)
+                                ),
+                                i + 1,
+                                True
+                            )
+                            for i, d in enumerate(dets)
+                        ]
 
-                self._render(frame, boxes, pixel_size, box_color_bgr, box_thickness)
-                writer.write(frame)
-                frame_idx += 1
+                    if boxes:
+                        self._render(frame, boxes, pixel_size, box_color_bgr, box_thickness)
+                    write(frame)
+                    frame_idx += 1
 
-                if progress_callback and denom > 0:
-                    progress_callback(min(offset + frame_idx, denom), denom)
+                    if progress_callback and denom > 0:
+                        progress_callback(min(offset + frame_idx, denom), denom)
+            finally:
+                cap.release()
 
-        finally:
-            cap.release()
-            writer.release()
+        # Fast path: frames are piped straight into the final H.264 encode (one encode
+        # instead of two, no intermediate file).
+        if self._encode_direct(render_all, input_path, output_path, fps, width, height):
+            return output_path
 
+        # Fallback (e.g. libx264 unavailable, odd frame size): intermediate file, then mux.
+        # Unique, unpredictable, atomically created temp file (only readable by the user on POSIX)
+        temp_fd, temp_video_path = tempfile.mkstemp(prefix="facemask_render_", suffix=".mp4")
+        os.close(temp_fd)
+        writer = cv2.VideoWriter(temp_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
         try:
+            try:
+                render_all(writer.write)
+            finally:
+                writer.release()
             self._mux_audio_with_ffmpeg(temp_video_path, input_path, output_path)
         finally:
             if os.path.exists(temp_video_path):
@@ -723,6 +729,71 @@ class FaceMasker:
                     pass
 
         return output_path
+
+    @staticmethod
+    def _encode_direct(
+        render_all: Callable[[Callable[[np.ndarray], None]], None],
+        original_video_path: str,
+        output_path: str,
+        fps: float,
+        width: int,
+        height: int
+    ) -> bool:
+        """
+        Encode the rendered frames to H.264 through an FFmpeg pipe, with the original
+        audio. Returns False if FFmpeg could not do it (the caller then falls back to
+        the intermediate-file path); errors raised while rendering propagate.
+        """
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-video_size", f"{width}x{height}",
+            "-framerate", f"{fps:.6f}",
+            "-i", "pipe:0",
+            "-protocol_whitelist", "file",
+            "-i", os.path.abspath(original_video_path),
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "19",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-map", "0:v:0",
+            "-map", "1:a:0?",
+            "-shortest",
+            os.path.abspath(output_path)
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return False
+
+        class _EncoderGone(Exception):
+            pass
+
+        def write(frame: np.ndarray) -> None:
+            try:
+                proc.stdin.write(frame.tobytes())
+            except OSError as e:  # FFmpeg exited (BrokenPipe on POSIX, EINVAL on Windows)
+                raise _EncoderGone() from e
+
+        try:
+            render_all(write)
+        except _EncoderGone:
+            proc.kill()
+            proc.wait()
+            return False
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        return proc.wait() == 0
 
     @staticmethod
     def _mux_audio_with_ffmpeg(processed_video_path: str, original_video_path: str, output_path: str) -> None:
