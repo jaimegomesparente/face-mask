@@ -583,6 +583,8 @@ class FaceMasker:
     DEFAULT_BOX_COLOR = (60, 255, 0)
     DEFAULT_BOX_THICKNESS = 1
     DEFAULT_CONF_THRESHOLD = 0.30
+    # Small-face mode: width of each half-frame tile, relative to the frame
+    TILE_RATIO = 0.625
     # Re-identification: appearance vectors are computed on one frame out of N
     REID_STRIDE = 3
 
@@ -644,9 +646,38 @@ class FaceMasker:
                 self._current_size = (width, height)
         return self._detector
 
-    def detect_faces(self, frame: np.ndarray, conf_threshold: float = DEFAULT_CONF_THRESHOLD) -> List[Detection]:
+    def detect_faces(
+        self,
+        frame: np.ndarray,
+        conf_threshold: float = DEFAULT_CONF_THRESHOLD,
+        small_faces: bool = False
+    ) -> List[Detection]:
         with self._lock:
-            return self._detect_faces_unlocked(frame, conf_threshold)
+            dets = self._detect_faces_unlocked(frame, conf_threshold)
+        if not small_faces:
+            return dets
+
+        # Small-face mode: also run the detector on two overlapping halves of the frame,
+        # where faces are about 1.6x larger for the network than in the whole frame.
+        h, w = frame.shape[:2]
+        if w >= h:
+            tw, th = int(w * self.TILE_RATIO), h
+            origins = [(0, 0), (w - tw, 0)]
+        else:
+            tw, th = w, int(h * self.TILE_RATIO)
+            origins = [(0, 0), (0, h - th)]
+        dets = list(dets)
+        for x0, y0 in origins:
+            with self._lock:
+                tile_dets = self._detect_faces_unlocked(frame[y0:y0 + th, x0:x0 + tw], conf_threshold)
+            for d in tile_dets:
+                x, y, bw, bh = d.bbox
+                dets.append(Detection((x + x0, y + y0, bw, bh), d.score, d.reject))
+        if len(dets) <= 1:
+            return dets
+        # The same face is usually found in several passes: keep the best box of each
+        keep = cv2.dnn.NMSBoxes([list(d.bbox) for d in dets], [d.score for d in dets], 0.0, 0.45)
+        return [dets[int(i)] for i in np.array(keep).reshape(-1)]
 
     def _detect_faces_unlocked(self, frame: np.ndarray, conf_threshold: float) -> List[Detection]:
         if self.is_yolo:
@@ -820,10 +851,11 @@ class FaceMasker:
         box_color_bgr: Tuple[int, int, int] = DEFAULT_BOX_COLOR,
         box_thickness: int = DEFAULT_BOX_THICKNESS,
         conf_threshold: float = DEFAULT_CONF_THRESHOLD,
-        debug: bool = False
+        debug: bool = False,
+        small_faces: bool = False
     ) -> Tuple[np.ndarray, int]:
         out_frame = frame.copy()
-        dets = self.detect_faces(out_frame, conf_threshold=conf_threshold)
+        dets = self.detect_faces(out_frame, conf_threshold=conf_threshold, small_faces=small_faces)
 
         boxes = []
         for i, d in enumerate(dets):
@@ -843,7 +875,8 @@ class FaceMasker:
         progress_callback: Optional[Callable[[int, int], None]],
         total_frames: int,
         embedder: Optional[FaceEmbedder] = None,
-        frame_range: Optional[Tuple[int, float]] = None
+        frame_range: Optional[Tuple[int, float]] = None,
+        small_faces: bool = False
     ) -> List[List[Detection]]:
         cap = cv2.VideoCapture(input_path)
         per_frame: List[List[Detection]] = []
@@ -866,7 +899,7 @@ class FaceMasker:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                dets = self.detect_faces(frame, conf_threshold=scan_conf)
+                dets = self.detect_faces(frame, conf_threshold=scan_conf, small_faces=small_faces)
                 if embedder is not None and len(per_frame) % self.REID_STRIDE == 0:
                     with self._lock:
                         for d in dets:
@@ -892,9 +925,12 @@ class FaceMasker:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         debug: bool = False,
         reidentify: bool = False,
-        mask_range: Optional[Tuple[Optional[float], Optional[float]]] = None
+        mask_range: Optional[Tuple[Optional[float], Optional[float]]] = None,
+        small_faces: bool = False
     ) -> str:
         """
+        small_faces: also detect on two overlapping halves of each frame. About 3x
+        slower, but catches the tiny faces of crowds and wide shots.
         reidentify: keep the same ID for a person who leaves the frame and comes back
         (needs use_tracking). Only changes the ID badges, never the masked areas.
         mask_range: (start, end) in seconds, either bound may be None. Faces are only
@@ -937,7 +973,7 @@ class FaceMasker:
             margin = PersistentTracker().max_gap
             scan_range = (first_masked - margin, last_masked + margin) if partial else None
             per_frame = self._scan_video(
-                input_path, conf_threshold, progress_callback, total_frames, embedder, scan_range
+                input_path, conf_threshold, progress_callback, total_frames, embedder, scan_range, small_faces
             )
             masks = PersistentTracker().build(
                 per_frame, frame_size=(width, height), conf_threshold=conf_threshold,
@@ -973,7 +1009,7 @@ class FaceMasker:
                             for b, track_id, det in raw_tracks
                         ]
                     else:
-                        dets = self.detect_faces(frame, conf_threshold=conf_threshold)
+                        dets = self.detect_faces(frame, conf_threshold=conf_threshold, small_faces=small_faces)
                         boxes = [
                             (
                                 (

@@ -53,6 +53,7 @@ Options:
 - `-o, --output`: output path (default: `<name>_masked.mp4`).
 - `--conf`: detection confidence threshold (default: 0.30).
 - `--no-tracking`: disable temporal tracking and smoothing (per-frame detection only).
+- `--small-faces`: also detect on two overlapping halves of each frame. Catches the tiny faces of crowds and wide shots (under ~10 px), about 3x slower.
 - `--reid`: keep the same ID when a person leaves the frame and comes back (off by default, see below).
 - `--start`, `--end`: only mask faces between these times (seconds, `MM:SS` or `HH:MM:SS`). Either can be omitted. Faces outside this portion stay visible.
 

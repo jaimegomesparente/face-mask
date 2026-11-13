@@ -38,6 +38,10 @@ def parse_args():
         help="Keep the same ID when a person leaves the frame and comes back (slower, in-memory face comparison)"
     )
     parser.add_argument(
+        "--small-faces", action="store_true",
+        help="Also detect on two halves of each frame: catches tiny faces (crowds, wide shots), about 3x slower"
+    )
+    parser.add_argument(
         "--start", type=parse_time, default=None, metavar="TIME",
         help="Only mask faces from this time on (seconds, MM:SS or HH:MM:SS; default: beginning)"
     )
@@ -68,6 +72,7 @@ def main():
     print(f"Output file   : {output_path}")
     print(f"Stabilization : {'Disabled' if args.no_tracking else 'Enabled'}")
     print(f"Persistent IDs: {'Enabled' if args.reid else 'Disabled'}")
+    print(f"Small faces   : {'Enabled' if args.small_faces else 'Disabled'}")
     mask_range = None
     if args.start is not None or args.end is not None:
         mask_range = (args.start, args.end)
@@ -93,6 +98,7 @@ def main():
             conf_threshold=args.conf,
             use_tracking=not args.no_tracking,
             reidentify=args.reid,
+            small_faces=args.small_faces,
             mask_range=mask_range,
             progress_callback=on_progress
         )

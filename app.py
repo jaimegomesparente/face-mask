@@ -499,6 +499,12 @@ if uploaded_file is not None:
             help="Lower values increase sensitivity on side angles and profile faces."
         )
 
+    small_faces = st.checkbox(
+        "Detect small faces (crowds, wide shots)",
+        value=False,
+        help="Also analyzes two halves of each frame to catch tiny faces. About 3x slower."
+    )
+
     current_tc = format_timecode(frame_idx, fps)
     st.markdown(f"""
     <div class="section-bar">
@@ -516,7 +522,8 @@ if uploaded_file is not None:
     if ret and frame_bgr is not None:
         processed_bgr, face_count = masker.process_frame(
             frame_bgr,
-            conf_threshold=conf_threshold
+            conf_threshold=conf_threshold,
+            small_faces=small_faces
         )
 
         orig_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -596,6 +603,7 @@ if uploaded_file is not None:
                     output_path=output_video_path,
                     conf_threshold=conf_threshold,
                     reidentify=reidentify,
+                    small_faces=small_faces,
                     mask_range=mask_range,
                     progress_callback=update_progress
                 )
